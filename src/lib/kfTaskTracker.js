@@ -1,4 +1,4 @@
-import { kfGetJson, resolveKissflowAccountId, KF_ADMIN_PAGE_SIZE, runWithConcurrency } from './kfRuntime.js';
+import { kfGetJson, kfMutateJson, resolveKissflowAccountId, KF_ADMIN_PAGE_SIZE, runWithConcurrency } from './kfRuntime.js';
 import { fetchMyIndividualTasks } from './kfProjectTrackerKarthika.js';
 import { buildPmProcessApiPaths } from './kfPmMyItemsPaths.js';
 import { TASKS_ENTITY } from './pmMyItemsEntities.js';
@@ -66,15 +66,100 @@ export function mapTaskRag(task) {
   return 'Amber';
 }
 
+/** True for Kissflow process instance ids (Pk…), not business Task-PRJ-… ids. */
+function isKissflowPkId(value) {
+  const text = String(value ?? '').trim();
+  return !text || text.startsWith('Pk') || text === '[object Object]';
+}
+
+/**
+ * Pick first usable task business id (Task-PRJ-… / formulated), never Pk instance ids.
+ * Accepts nested Kissflow lookup objects (e.g. Task_ID: { Subtaxk_id }).
+ */
+export function pickTaskBusinessId(...candidates) {
+  for (const candidate of candidates) {
+    if (candidate == null || candidate === '') continue;
+    if (typeof candidate === 'object') {
+      const nested = pickTaskBusinessId(
+        candidate.Subtaxk_id,
+        candidate.Task_ID_Formulated,
+        candidate.Task_ID_Hidden,
+        candidate.Project_Task_ID,
+        candidate.Name,
+        candidate._id,
+      );
+      if (nested) return nested;
+      continue;
+    }
+    const text = String(candidate).trim();
+    if (isKissflowPkId(text)) continue;
+    return text;
+  }
+  return '';
+}
+
 export function resolveTaskBusinessIdFromRow(row) {
-  const direct = String(row?.taskId ?? '').trim();
-  if (direct && !direct.startsWith('Pk')) return direct;
+  const raw = row?.raw && typeof row.raw === 'object' ? row.raw : {};
+  const nameLike = String(raw?.Name || row?.taskName || row?.name || '').trim();
+  const nameAsId = /^Task[-_]/i.test(nameLike) ? nameLike : '';
 
-  const id = String(row?.id ?? '').trim();
-  if (id && !id.startsWith('Pk')) return id;
+  return pickTaskBusinessId(
+    row?.taskBusinessId,
+    row?.taskId,
+    row?.id,
+    raw?.Subtaxk_id,
+    raw?.Task_ID_Formulated,
+    raw?.Task_ID_Hidden,
+    raw?.Project_Task_ID,
+    raw?.Task_ID,
+    row?.Task_ID,
+    nameAsId,
+  );
+}
 
-  const raw = row?.raw ?? {};
-  return String(raw?.Subtaxk_id || raw?.Task_ID_Formulated || raw?.Task_ID_Hidden || '').trim();
+/**
+ * Hub myitems/pending rows often omit Subtaxk_id. Resolve from row first; if missing,
+ * fetch that one instance detail and read the business id — for Add subtask only.
+ */
+export async function ensureTaskBusinessIdForCreate(kfInstance, row) {
+  const existing = resolveTaskBusinessIdFromRow(row);
+  if (existing) return existing;
+
+  const instanceId = String(
+    row?.InstanceID || row?._id || row?.raw?._id || row?.raw?._item_id || '',
+  ).trim();
+  if (!instanceId || !kfInstance) return '';
+
+  // Prefer admin item detail (same path for Open + Withdrawn; includes Subtaxk_id).
+  const adminDetail = await fetchTaskAdminItemDetail(kfInstance, instanceId);
+  if (adminDetail) {
+    const fromAdmin = resolveTaskBusinessIdFromRow({
+      raw: adminDetail,
+      taskId: adminDetail?.Subtaxk_id || adminDetail?.Task_ID_Formulated,
+      id: adminDetail?.Subtaxk_id || adminDetail?.Task_ID_Formulated,
+    });
+    if (fromAdmin) return fromAdmin;
+  }
+
+  const seed = {
+    ...(row?.raw && typeof row.raw === 'object' ? row.raw : {}),
+    _id: instanceId,
+    _item_id: instanceId,
+    _activity_instance_id:
+      row?.ActivityID ||
+      row?._activity_instance_id ||
+      row?.raw?._activity_instance_id ||
+      undefined,
+  };
+  delete seed['Table::Task_History'];
+
+  const enriched = await enrichRawTaskRowsWithInstanceDetail(kfInstance, [seed], { maxRows: 1 });
+  const detail = enriched?.[0];
+  return resolveTaskBusinessIdFromRow({
+    raw: detail,
+    taskId: detail?.Subtaxk_id || detail?.Task_ID_Formulated,
+    id: detail?.Subtaxk_id || detail?.Task_ID_Formulated,
+  });
 }
 
 /** Normalize Kissflow `Table::Task_History` (array or single object). */
@@ -86,7 +171,10 @@ export function normalizeTaskHistory(raw) {
 
 /**
  * Task timeline revisions from `Table::Task_History` (`New_Timeline`, `Changed_on`).
- * Each history row is a timeline change (badge Nx), same UI pattern as project Revised.
+ * Same semantics as project `deriveTimelineEndDates`:
+ * - index 0 = baseline / planned end (not counted as a revision)
+ * - length 1 → revisedCount 0 (no real revision yet)
+ * - length 4 → revisedCount 3 (show 3x; history entries 1,2,3)
  */
 export function deriveTaskRevisionFields(raw, originalEndDate = null) {
   const history = normalizeTaskHistory(raw)
@@ -102,23 +190,55 @@ export function deriveTaskRevisionFields(raw, originalEndDate = null) {
     .filter((r) => r.newDate)
     .sort((a, b) => (a.changedAt?.getTime() || 0) - (b.changedAt?.getTime() || 0));
 
-  const revisedCount = history.length;
-  const hasRevision = revisedCount > 0;
-  const revisedEndDate = hasRevision ? history[history.length - 1].newDate : null;
-  const previousEndDate =
-    history.length >= 2 ? history[history.length - 2].newDate : (originalEndDate || null);
+  const plannedEndDate = history[0]?.newDate ?? originalEndDate ?? null;
+
+  if (history.length === 0) {
+    return {
+      revisedCount: 0,
+      hasRevision: false,
+      revisedEndDate: null,
+      previousEndDate: originalEndDate || null,
+      originalEndDate: originalEndDate || null,
+      plannedEndDate: null,
+      revisionHistory: [],
+    };
+  }
+
+  if (history.length === 1) {
+    return {
+      revisedCount: 0,
+      hasRevision: false,
+      revisedEndDate: null,
+      previousEndDate: plannedEndDate,
+      originalEndDate: plannedEndDate || originalEndDate || null,
+      plannedEndDate,
+      revisionHistory: history.map((h, i) => ({
+        date: fmtDate(h.changedAt),
+        previousEndDate: originalEndDate || '—',
+        newEndDate: h.newDate,
+        reason: 'Baseline timeline',
+        revisedBy: h.revisedBy,
+        key: h.raw?._id || `TASK-REV-${i + 1}`,
+      })),
+    };
+  }
+
+  const revisedCount = history.length - 1;
+  const revisedEndDate = history[history.length - 1].newDate;
+  const previousEndDate = history[history.length - 2].newDate;
 
   return {
     revisedCount,
-    hasRevision,
+    hasRevision: true,
     revisedEndDate,
     previousEndDate,
-    originalEndDate: originalEndDate || null,
+    originalEndDate: plannedEndDate || originalEndDate || null,
+    plannedEndDate,
     revisionHistory: history.map((h, i) => ({
       date: fmtDate(h.changedAt),
       previousEndDate: i > 0 ? history[i - 1].newDate : (originalEndDate || '—'),
       newEndDate: h.newDate,
-      reason: 'Timeline updated',
+      reason: i === 0 ? 'Baseline timeline' : 'Timeline updated',
       revisedBy: h.revisedBy,
       key: h.raw?._id || `TASK-REV-${i + 1}`,
     })),
@@ -126,7 +246,11 @@ export function deriveTaskRevisionFields(raw, originalEndDate = null) {
 }
 
 function activityInstanceIdOf(row) {
-  const raw = row?._activity_instance_id ?? row?.activityInstanceId ?? row?._entity_id;
+  const raw =
+    row?._activity_instance_id ??
+    row?.ActivityID ??
+    row?.activityInstanceId ??
+    row?._entity_id;
   if (Array.isArray(raw)) return String(raw[0] || '').trim();
   return String(raw || '').trim();
 }
@@ -142,18 +266,41 @@ function unwrapInstanceDetail(response) {
   return response;
 }
 
+function displayish(value) {
+  if (value == null) return '';
+  if (typeof value === 'object') {
+    return String(value.Name || value.name || value._id || '').trim();
+  }
+  return String(value).trim();
+}
+
 function rawRowNeedsInstanceEnrichment(row) {
   if (!row || typeof row !== 'object') return false;
-  // Admin/pending list omits Table::Task_History — always pull instance detail when missing.
-  return !Object.prototype.hasOwnProperty.call(row, 'Table::Task_History');
+
+  // List APIs omit history and often omit form fields used by the task detail popup.
+  const hasHistory = Object.prototype.hasOwnProperty.call(row, 'Table::Task_History');
+  const hasEntity = Boolean(displayish(row.Entity ?? row.Entity_1));
+  const hasFunctions = Boolean(displayish(row.Functions ?? row.Function ?? row.Department));
+  const hasTaskType = Boolean(displayish(row.Task_type ?? row.Task_Type ?? row.Type));
+  const hasBusinessId = Boolean(
+    displayish(row.Subtaxk_id || row.Task_ID_Formulated || row.Task_ID_Hidden),
+  );
+
+  if (!hasHistory) return true;
+  if (!hasEntity || !hasFunctions || !hasTaskType) return true;
+  if (!hasBusinessId) return true;
+  return false;
 }
 
 /**
- * Pending/admin list rows omit `Table::Task_History` (and often Project_ID).
- * Merge instance detail so Revised / project columns work.
+ * Prefer admin item detail (works for Open + Withdrawn / no activity):
+ *   GET /process/2/{acc}/admin/Project_Sub_Task_A01/{instanceId}?_application_id=…
+ *   Headers: X-Access-Key-Id / X-Access-Key-Secret
  *
- * Prefer admin/item and instance-without-activity paths — pairing
- * instanceId/activityInstanceId often 400s and floods the tenant.
+ * Returns Entity, Functions, Task_type, Subtaxk_id, Table::Task_History for
+ * Revised badges + custom task detail popup fields (dev + prod same path shape).
+ *
+ * Fallback: instance/activity path when admin detail is unavailable.
  */
 export async function enrichRawTaskRowsWithInstanceDetail(kfInstance, rows, options = {}) {
   const list = Array.isArray(rows) ? rows : [];
@@ -166,26 +313,65 @@ export async function enrichRawTaskRowsWithInstanceDetail(kfInstance, rows, opti
   const needIdx = [];
   list.forEach((row, idx) => {
     if (maxRows && needIdx.length >= maxRows) return;
-    const id = String(row?._id || row?._item_id || '').trim();
+    const id = String(row?._id || row?._item_id || row?.InstanceID || '').trim();
     if (id && rawRowNeedsInstanceEnrichment(row)) needIdx.push(idx);
   });
   if (!needIdx.length) return list;
 
   const details = await runWithConcurrency(needIdx, TASK_DETAIL_CONCURRENCY, async (idx) => {
     const row = list[idx];
-    const id = String(row?._id || row?._item_id || '').trim();
+    const id = String(row?._id || row?._item_id || row?.InstanceID || '').trim();
     const act = activityInstanceIdOf(row);
-    const tryPaths = [];
-    // Safer order: avoid instance/activity pair first (frequent 400s).
-    if (paths.itemBase) tryPaths.push(`${paths.itemBase}/${encodeURIComponent(id)}`);
-    tryPaths.push(paths.getInstancePath(id));
-    if (act) tryPaths.push(paths.getInstancePath(id, act));
+    const adminDetailPath =
+      typeof paths.getAdminItemDetailPath === 'function'
+        ? paths.getAdminItemDetailPath(id)
+        : `${paths.itemBase}/${encodeURIComponent(id)}?_application_id=${encodeURIComponent(paths.applicationId || '')}`;
 
-    for (const path of tryPaths) {
+    /** @type {{ path: string, useAccessKeys?: boolean }[]} */
+    const tryCalls = [];
+
+    // 1) Admin item detail — reliable for Withdrawn / completed (no activity id) + form fields.
+    tryCalls.push({ path: adminDetailPath, useAccessKeys: true });
+    tryCalls.push({ path: adminDetailPath, useAccessKeys: false });
+
+    // 2) Instance + activity (Postman open-step shape) when activity is present.
+    if (act) {
+      tryCalls.push({
+        path: `/process/2/${paths.accountId}/${paths.processId}/${encodeURIComponent(id)}/${encodeURIComponent(act)}`,
+        useAccessKeys: true,
+      });
+      tryCalls.push({ path: paths.getInstancePath(id, act), useAccessKeys: true });
+      tryCalls.push({ path: paths.getInstancePath(id, act), useAccessKeys: false });
+    }
+
+    // 3) Instance without activity.
+    tryCalls.push({ path: paths.getInstancePath(id), useAccessKeys: true });
+    tryCalls.push({ path: paths.getInstancePath(id), useAccessKeys: false });
+
+    for (const call of tryCalls) {
       try {
-        const response = await kfGetJson(kfInstance, path);
+        let response;
+        if (call.useAccessKeys) {
+          response = await kfMutateJson(kfInstance, call.path, {
+            method: 'GET',
+            useAccessKeys: true,
+            allowSdkFallback: true,
+          });
+        } else {
+          response = await kfGetJson(kfInstance, call.path);
+        }
         const detail = unwrapInstanceDetail(response);
-        if (detail && (detail._id || detail.Project_ID || detail.Sub_Task_Name || detail['Table::Task_History'])) {
+        if (
+          detail &&
+          (detail._id ||
+            detail.Project_ID ||
+            detail.Sub_Task_Name ||
+            detail.Entity ||
+            detail.Functions ||
+            detail.Task_type ||
+            detail.Task_Type ||
+            detail['Table::Task_History'])
+        ) {
           return { idx, detail };
         }
       } catch {
@@ -193,7 +379,14 @@ export async function enrichRawTaskRowsWithInstanceDetail(kfInstance, rows, opti
       }
     }
     // Mark attempted so callers that re-check won't keep treating as "needs enrich".
-    return { idx, detail: { 'Table::Task_History': [] } };
+    return {
+      idx,
+      detail: {
+        'Table::Task_History': Array.isArray(row?.['Table::Task_History'])
+          ? row['Table::Task_History']
+          : [],
+      },
+    };
   });
 
   const out = list.slice();
@@ -205,7 +398,8 @@ export async function enrichRawTaskRowsWithInstanceDetail(kfInstance, rows, opti
       ...entry.detail,
       _id: listRow?._id || entry.detail._id,
       _item_id: listRow?._item_id || entry.detail._item_id,
-      _activity_instance_id: listRow?._activity_instance_id || entry.detail._activity_instance_id,
+      _activity_instance_id:
+        listRow?._activity_instance_id || entry.detail._activity_instance_id,
       _activity_id: listRow?._activity_id || entry.detail._activity_id,
       _current_step: listRow?._current_step || entry.detail._current_step,
     };
@@ -213,11 +407,51 @@ export async function enrichRawTaskRowsWithInstanceDetail(kfInstance, rows, opti
   return out;
 }
 
+/** Fetch one task admin detail (Entity / Functions / Task_type / history). Dev + prod. */
+export async function fetchTaskAdminItemDetail(kfInstance, instanceId) {
+  const id = String(instanceId || '').trim();
+  if (!id || !kfInstance) return null;
+  const paths = buildPmProcessApiPaths(kfInstance, TASKS_ENTITY);
+  if (!paths) return null;
+  const path =
+    typeof paths.getAdminItemDetailPath === 'function'
+      ? paths.getAdminItemDetailPath(id)
+      : `${paths.itemBase}/${encodeURIComponent(id)}?_application_id=${encodeURIComponent(paths.applicationId || '')}`;
+
+  try {
+    const response = await kfMutateJson(kfInstance, path, {
+      method: 'GET',
+      useAccessKeys: true,
+      allowSdkFallback: true,
+    });
+    return unwrapInstanceDetail(response);
+  } catch {
+    try {
+      return unwrapInstanceDetail(await kfGetJson(kfInstance, path));
+    } catch {
+      return null;
+    }
+  }
+}
+
 export function mapProcessSubtaskItem(item) {
   const raw = item?.raw && typeof item.raw === 'object' ? item.raw : null;
-  const summary = String(
-    item?.summary || raw?.SubTask_Summary || item?.name || '',
+  const named = String(
+    raw?.Sub_task_Name ||
+      raw?.Sub_Task_Name ||
+      raw?.Subtask_Name ||
+      item?.subtaskName ||
+      item?.name ||
+      '',
   ).trim();
+  const summary = String(item?.summary || raw?.SubTask_Summary || '').trim();
+  const systemName = String(raw?.Name || '').trim();
+  const isProcessLabel = /^sub[-\s]?task process from\b/i.test(systemName);
+  const displayName =
+    named ||
+    summary ||
+    (!isProcessLabel && systemName && !/^Pk[A-Za-z0-9]+$/.test(systemName) ? systemName : '') ||
+    'Untitled subtask';
   const assigneeName = String(
     item?.assigneeName ||
       item?.people?.[0]?.name ||
@@ -227,13 +461,13 @@ export function mapProcessSubtaskItem(item) {
   const createdBy = String(
     item?.createdBy || raw?._created_by?.Name || '',
   ).trim() || '—';
-  const displayName = summary || 'Untitled subtask';
 
   return {
     id: item.id,
     parentTaskBusinessId: item.parentTaskBusinessId,
     taskName: displayName,
-    summary: summary || '—',
+    subtaskName: displayName,
+    summary: summary || named || '—',
     assignedTo: assigneeName,
     createdBy,
     assigneeAvatar: item?.people?.[0]?.l || toInitials(assigneeName !== '—' ? assigneeName : createdBy),
@@ -484,9 +718,13 @@ export function mapAdminTaskRow(r, idx = 0) {
         ? Math.max(0, Math.ceil((now.getTime() - end.getTime()) / (1000 * 60 * 60 * 24)))
         : 0;
 
-  const taskBusinessId = String(
-    r?.Subtaxk_id || r?.Task_ID_Formulated || r?.Task_ID_Hidden || r?.Task_ID || '',
-  ).trim();
+  const taskBusinessId = pickTaskBusinessId(
+    r?.Subtaxk_id,
+    r?.Task_ID_Formulated,
+    r?.Task_ID_Hidden,
+    r?.Project_Task_ID,
+    r?.Task_ID,
+  );
 
   const entity = displayFieldValue(r?.Entity?.Name || r?.Entity || r?.Entity_1);
   const functions = displayFieldValue(r?.Functions || r?.Function || r?.Department);
@@ -497,9 +735,12 @@ export function mapAdminTaskRow(r, idx = 0) {
   const functionType = displayFieldValue(r?.Function_Type);
   const createdAt = fmtDate(parseKfDate(r?._created_at || r?.Created_at));
 
+  const instanceKey = String(r?._id || r?._item_id || `TASK-${idx + 1}`).trim();
   const row = {
-    id: String(r?.Subtaxk_id || r?._id || r?._item_id || `TASK-${idx + 1}`).trim(),
-    taskId: taskBusinessId || String(r?.Subtaxk_id || r?._id || `TASK-${idx + 1}`).trim(),
+    id: taskBusinessId || instanceKey,
+    /** Prefer real business id; keep empty rather than Pk so create can enrich. */
+    taskId: taskBusinessId || '',
+    taskBusinessId: taskBusinessId || '',
     InstanceID: String(r?._id || r?._item_id || '').trim(),
     ActivityID: Array.isArray(r?._activity_instance_id)
       ? (r._activity_instance_id[0] ?? '')

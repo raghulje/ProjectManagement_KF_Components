@@ -158,10 +158,12 @@ export function mapMyTeamProjectRow(row, columns) {
       : 0;
 
   const start = fmtDate(parseKfDate(read('Start_Date'))) || '—';
-  const end =
-    fmtDate(parseKfDate(read('Actual_End_Date_1'))) ||
-    fmtDate(parseKfDate(read('End_Date'))) ||
-    '—';
+  const plannedEnd = fmtDate(parseKfDate(read('End_Date'))) || '';
+  const actualEnd = fmtDate(parseKfDate(read('Actual_End_Date_1'))) || '';
+  const end = actualEnd || plannedEnd || '—';
+  // Case report has no revision timeline; treat differing planned vs actual end as one revision.
+  const hasRevision = Boolean(actualEnd && plannedEnd && actualEnd !== plannedEnd);
+  const revisedCount = hasRevision ? 1 : 0;
 
   const delayDays = computeProjectDelayDays(status, end);
   const rag = computeProjectRag({
@@ -206,6 +208,10 @@ export function mapMyTeamProjectRow(row, columns) {
     delayDays,
     end,
     start,
+    originalEndDate: plannedEnd || null,
+    revisedEndDate: hasRevision ? actualEnd : null,
+    revisedCount,
+    hasRevision,
     health,
     status,
     rag,
@@ -256,18 +262,9 @@ export function mapMyTeamProjectsResponse(response, options = {}) {
   );
 
   if (hasManagerFields) {
-    const filtered = filterProjectsByManagerEmail(projects, loggedInEmail);
-    // Preference/session-scoped reports may already be narrowed; don't wipe to empty
-    // when L1/L2 columns exist but don't match this user identity.
-    if (filtered.length > 0) {
-      projects = filtered;
-    } else if (!trustApiScope) {
-      projects = [];
-    } else {
-      console.warn(
-        `My Team projects: ${projects.length} API row(s) but 0 after L1/L2 filter for ${loggedInEmail}; keeping API-scoped rows`,
-      );
-    }
+    // L1/L2 match is authoritative. Preference params often return unscoped rows;
+    // never keep the full API payload when this user matches nobody.
+    projects = filterProjectsByManagerEmail(projects, loggedInEmail);
   } else if (!trustApiScope) {
     projects = [];
   }

@@ -3,7 +3,7 @@ import { AnimatePresence, motion } from 'framer-motion';
 import AppLayout from './components/feature/AppLayout.jsx';
 import DashboardDetailModal from './components/DashboardDetailModal.jsx';
 import PtSelect from './components/PtSelect.jsx';
-import PtDateRangePicker from './components/PtDateRangePicker.jsx';
+import DashboardPeriodPicker, { getEmptyPeriodState } from './components/DashboardPeriodPicker.jsx';
 import TablePaginationBar, { PT_TABLE_PAGE_SIZE } from './components/TablePaginationBar.jsx';
 import {
   TableColumnHeader,
@@ -16,11 +16,12 @@ import {
 import SatelliteOrbitMenu from './components/SatelliteOrbitMenu.jsx';
 import SubtaskAccordionRow from './components/SubtaskAccordionRow.jsx';
 import UserHubTaskToolbar from './components/UserHubTaskToolbar.jsx';
+import PtUserAvatar from './components/PtUserAvatar.jsx';
+import UserHubSubTasksPage from './UserHubSubTasksPage.jsx';
 import { PROJECT_TASK_SATELLITE_OPTIONS } from './lib/kfSatelliteCreate.js';
 import { KissflowSDKContext, kf } from './sdk/index.js';
 import {
   fetchProjectDashboardData,
-  parseKfDate,
   personMatches,
   projectOwnedOrStewardedByUser,
   toInitials,
@@ -37,11 +38,15 @@ import { fetchMyTeamProjects } from './lib/kfMyTeamProjects.js';
 import {
   fetchMyTeamTasks,
 } from './lib/kfMyTeamTasks.js';
+import { fetchMyTeamSubtasks } from './lib/kfMyTeamSubtasks.js';
+import { fetchSubtaskAdminDetailById } from './lib/kfSubtaskTracker.js';
 import {
+  deleteTaskDraftRecords,
   fetchAssignedClosedProcessTasks,
   fetchAssignedOpenProcessTasks,
   fetchMyCreatedTasksByStatus,
   fetchUserHubTaskCounts,
+  resolveTaskDraftDeleteId,
   unwrapTaskPageResult,
   HUB_TASK_PAGE_SIZE,
 } from './lib/kfPmTaskProcessItems.js';
@@ -54,9 +59,6 @@ import {
   enrichTasksWithProjectCatalog,
 } from './lib/kfTaskTracker.js';
 import {
-  buildCreatedYearOptions,
-  getCreatedPeriodOptions,
-  resolveCreatedDateRange,
   matchesCreatedDateRange,
 } from './lib/dashboardCreatedDateFilters.js';
 import {
@@ -66,6 +68,35 @@ import {
   rowMatchesPortfolioDimensions,
   taskMatchesPortfolioDimensions,
 } from './lib/dashboardDimensionFilters.js';
+
+/** Adaptive Period picker → single range or multi-window (FY H/Q multi-select). */
+function resolveUsptPeriodCreatedRanges(periodFrom, periodTo, periodRanges) {
+  if (Array.isArray(periodRanges) && periodRanges.length > 0) {
+    return periodRanges
+      .map((r) => {
+        const fromStr = String(r?.from || '').trim();
+        const toStr = String(r?.to || '').trim();
+        if (!fromStr || !toStr) return null;
+        const from = new Date(`${fromStr}T00:00:00`);
+        const to = new Date(`${toStr}T23:59:59.999`);
+        if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) return null;
+        return { from, to };
+      })
+      .filter(Boolean);
+  }
+  const fromStr = String(periodFrom || '').trim();
+  const toStr = String(periodTo || '').trim();
+  if (!fromStr || !toStr) return [];
+  const from = new Date(`${fromStr}T00:00:00`);
+  const to = new Date(`${toStr}T23:59:59.999`);
+  if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) return [];
+  return [{ from, to }];
+}
+
+function rowMatchesAnyCreatedRange(row, ranges) {
+  if (!Array.isArray(ranges) || ranges.length === 0) return true;
+  return ranges.some((range) => matchesCreatedDateRange(row, range));
+}
 
 function getGreeting() {
   const hour = new Date().getHours();
@@ -87,6 +118,102 @@ const USPT_POPUP_SIZE = {
   popupWidth: '960px',
   popupHeight: '720px',
 };
+
+/** Kissflow app global — persists UserSpecificPT table column filters across refresh. */
+const USPT_PAGE_FILTERS_VAR = 'PageFilters';
+
+const USPT_DEFAULT_TABLE_FILTERS = {
+  nameFilter: 'all',
+  ownerOrProjectFilter: 'all',
+  assigneeFilter: 'all',
+  priorityOrHealthFilter: 'all',
+  statusFilter: 'all',
+  taskOwnershipScope: 'assigned',
+  assignedStatus: 'open',
+  createdStatusFilter: 'Draft',
+};
+
+function usptPageFiltersViewKey(scope, mode) {
+  return `${String(scope || 'My Work')}|${String(mode || 'Tasks')}`;
+}
+
+function normalizeUsptPageFilters(raw) {
+  if (raw == null || raw === '') return null;
+  if (typeof raw === 'object' && !Array.isArray(raw)) return raw;
+  try {
+    const parsed = JSON.parse(String(raw));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+async function readUsptPageFilters(kfInstance) {
+  const sdk = resolveKfSdk(kfInstance);
+  if (!sdk?.app?.getVariable) return null;
+  try {
+    return normalizeUsptPageFilters(await sdk.app.getVariable(USPT_PAGE_FILTERS_VAR));
+  } catch {
+    return null;
+  }
+}
+
+async function writeUsptPageFilters(kfInstance, data) {
+  const sdk = resolveKfSdk(kfInstance);
+  if (!sdk?.app?.setVariable) return;
+  try {
+    await sdk.app.setVariable(USPT_PAGE_FILTERS_VAR, JSON.stringify(data ?? {}));
+  } catch {
+    /* ignore — variable may be missing in local/dev */
+  }
+}
+
+function pickUsptTableFilters(source = {}) {
+  const pick = (key, fallback) => {
+    const v = source?.[key];
+    return v == null || v === '' ? fallback : v;
+  };
+  return {
+    nameFilter: pick('nameFilter', USPT_DEFAULT_TABLE_FILTERS.nameFilter),
+    ownerOrProjectFilter: pick('ownerOrProjectFilter', USPT_DEFAULT_TABLE_FILTERS.ownerOrProjectFilter),
+    assigneeFilter: pick('assigneeFilter', USPT_DEFAULT_TABLE_FILTERS.assigneeFilter),
+    priorityOrHealthFilter: pick(
+      'priorityOrHealthFilter',
+      USPT_DEFAULT_TABLE_FILTERS.priorityOrHealthFilter,
+    ),
+    statusFilter: pick('statusFilter', USPT_DEFAULT_TABLE_FILTERS.statusFilter),
+    taskOwnershipScope: pick('taskOwnershipScope', USPT_DEFAULT_TABLE_FILTERS.taskOwnershipScope),
+    assignedStatus: pick('assignedStatus', USPT_DEFAULT_TABLE_FILTERS.assignedStatus),
+    createdStatusFilter: pick('createdStatusFilter', USPT_DEFAULT_TABLE_FILTERS.createdStatusFilter),
+  };
+}
+
+/** After Kissflow remounts this page (popup close refresh), jump back to the table. */
+const USPT_RETURN_TO_TABLE_KEY = 'userSpecificPT:returnToTable';
+
+function markUsptReturnToTable() {
+  try {
+    sessionStorage.setItem(USPT_RETURN_TO_TABLE_KEY, '1');
+  } catch {
+    /* ignore */
+  }
+}
+
+function peekUsptReturnToTable() {
+  try {
+    return sessionStorage.getItem(USPT_RETURN_TO_TABLE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function clearUsptReturnToTable() {
+  try {
+    sessionStorage.removeItem(USPT_RETURN_TO_TABLE_KEY);
+  } catch {
+    /* ignore */
+  }
+}
 
 function resolveKfSdk(kfInstance) {
   return kfInstance ?? (typeof window !== 'undefined' ? window.kf : null) ?? kf;
@@ -116,6 +243,7 @@ function openUsptKissflowPopup(kfInstance, popupId, instanceId, activityId) {
     return false;
   }
   try {
+    markUsptReturnToTable();
     const p = sdk.app.page.openPopup(popupId, {
       ActivityID: activityId,
       ActivityInstanceID: activityId,
@@ -157,6 +285,7 @@ function openUsptProjectPopup(kfInstance, caseId) {
     return false;
   }
   try {
+    markUsptReturnToTable();
     const p = sdk.app.page.openPopup(USPT_POPUP_IDS.project, {
       CaseID: caseId,
       ...USPT_POPUP_SIZE,
@@ -188,22 +317,50 @@ function mapUsptTaskToDetailRow(row) {
 }
 
 function mapUsptSubtaskToDetailRow(sub) {
+  const r = sub?.raw && typeof sub.raw === 'object' ? sub.raw : {};
+  const name =
+    String(
+      r?.Sub_task_Name ||
+        r?.Sub_Task_Name ||
+        r?.Subtask_Name ||
+        sub.subtaskName ||
+        sub.taskName ||
+        sub.name ||
+        '',
+    ).trim() ||
+    String(r?.SubTask_Summary || sub.summary || '').trim() ||
+    'Untitled subtask';
+  const parentFromTaskId =
+    r?.Task_ID && typeof r.Task_ID === 'object'
+      ? String(r.Task_ID.Sub_Task_Name || r.Task_ID.Sub_task_Name || r.Task_ID.Name || '').trim()
+      : '';
+
   return {
-    id: sub.id,
-    taskId: sub.parentTaskBusinessId || sub.id,
-    taskName: sub.summary && sub.summary !== '—' ? sub.summary : (sub.taskName || 'Untitled subtask'),
-    summary: sub.summary || sub.taskName || '—',
+    id: sub.id || r._id,
+    taskId: String(r?.Task_ID_Hidden || sub.parentTaskBusinessId || sub.parentTaskId || '').trim() || '—',
+    taskName: name,
+    summary: String(r?.SubTask_Summary || sub.summary || name || '—').trim() || '—',
+    parentTaskName: parentFromTaskId || sub.parentTaskName || '—',
+    parentTaskId: String(r?.Task_ID_Hidden || sub.parentTaskId || '').trim() || '—',
     projectName: sub.projectName || '—',
-    assignedTo: sub.assignedTo || '—',
-    createdBy: sub.createdBy || '—',
-    startDate: sub.startDate || '—',
-    endDate: sub.endDate || '—',
-    status: sub.status || '—',
+    projectId: sub.projectId || '—',
+    assignedTo:
+      (r?.Assignee_1 && typeof r.Assignee_1 === 'object' ? r.Assignee_1.Name : '') ||
+      sub.assignedTo ||
+      sub.assignee ||
+      '—',
+    createdBy:
+      (r?._created_by && typeof r._created_by === 'object' ? r._created_by.Name : '') ||
+      sub.createdBy ||
+      '—',
+    createdDate: sub.createdDate || '—',
+    priority: String(r?.Sub_task_Priority || sub.priority || '—').trim() || '—',
+    status: String(r?.TStatus || sub.status || '—').trim() || '—',
     delayDays: Number(sub.delayDays ?? 0),
     agingDays: Number(sub.agingDays ?? 0),
-    InstanceID: sub.InstanceID || sub._id || sub.id,
-    ActivityID: sub.ActivityID || sub._activity_instance_id,
-    raw: sub.raw ?? sub,
+    InstanceID: sub.InstanceID || r._id || sub._id || sub.id,
+    ActivityID: sub.ActivityID || r._activity_instance_id || sub._activity_instance_id,
+    raw: Object.keys(r).length ? r : (sub.raw ?? sub),
   };
 }
 
@@ -276,18 +433,18 @@ function TaskExpandToggle({
   ariaLabelCollapse = 'Collapse subtasks',
 }) {
   if (!visible) {
-    return <span className={`mt-0.5 ${sizeClass} shrink-0`} aria-hidden />;
+    return <span className={`${sizeClass} shrink-0`} aria-hidden />;
   }
   return (
     <button
       type="button"
       onClick={onToggle}
-      className={`mt-0.5 flex ${sizeClass} shrink-0 items-center justify-center rounded-md text-slate-400 transition hover:bg-slate-100 hover:text-[#1E88E5]`}
+      className={`flex ${sizeClass} shrink-0 items-center justify-center self-center rounded-md text-slate-400 transition hover:bg-slate-100 hover:text-[#1E88E5]`}
       aria-label={expanded ? ariaLabelCollapse : ariaLabelExpand}
       aria-expanded={expanded}
     >
       <i
-        className={`ri-arrow-${expanded ? 'down' : 'right'}-s-line ${iconClass}`}
+        className={`ri-arrow-${expanded ? 'down' : 'right'}-s-line leading-none ${iconClass}`}
         aria-hidden
       />
     </button>
@@ -332,7 +489,15 @@ function mapUsptProjectToDetailRow(row) {
     delayDays: Number(enriched.delayDays ?? 0),
     originalEndDate: enriched.end,
     revisedEndDate: enriched.revisedEndDate || null,
-    revisedCount: 0,
+    revisedCount: Number(enriched.revisedCount ?? enriched.raw?.revisedCount ?? 0) || 0,
+    hasRevision:
+      Boolean(enriched.hasRevision) ||
+      Number(enriched.revisedCount ?? enriched.raw?.revisedCount ?? 0) > 0,
+    revisionHistory: Array.isArray(enriched.revisionHistory)
+      ? enriched.revisionHistory
+      : Array.isArray(enriched.raw?.revisionHistory)
+        ? enriched.raw.revisionHistory
+        : [],
     startDate: enriched.start,
     priority: enriched.priority,
     lineOfBusiness: enriched.category,
@@ -365,12 +530,12 @@ function mapTaskForUserSpecificPT(t) {
       || '',
   ).trim();
 
-  return {
+    return {
     id: String(t?.taskId || t?.id || '').trim(),
     taskId: String(t?.taskId || t?.id || '').trim(),
     InstanceID: String(t?.InstanceID || t?._id || '').trim(),
     ActivityID: String(t?.ActivityID || '').trim(),
-    projectId,
+      projectId,
     project,
     name: t?.taskName || '—',
     assignee: t?.assignedTo || '—',
@@ -386,7 +551,7 @@ function mapTaskForUserSpecificPT(t) {
     revisionHistory: Array.isArray(t?.revisionHistory) ? t.revisionHistory : [],
     agingDays: Number(t?.agingDays ?? 0),
     delayDays,
-    delay: delayDays > 0 ? `+${delayDays}d` : 'On time',
+      delay: delayDays > 0 ? `+${delayDays}d` : 'On time',
     priority: String(t?.raw?.Task_Priority || t?.raw?.Priority || t?.priority || 'Medium').trim() || 'Medium',
     status: t?.status || '—',
     companyName: String(t?.companyName || t?.entity || '').trim(),
@@ -504,13 +669,13 @@ function isEmptyProjectName(projectName) {
 function UsptProjectCell({ projectName }) {
   if (isEmptyProjectName(projectName)) {
     return (
-      <span className="inline-flex items-center rounded-full bg-violet-50 px-2 py-0.5 text-[10px] font-semibold text-violet-700 ring-1 ring-violet-200/80">
+      <span className="inline-flex items-center rounded-full bg-violet-50 px-2 py-0.5 text-[10px] font-normal text-violet-700 ring-1 ring-violet-200/80">
         Individual Task
       </span>
     );
   }
   return (
-    <span className="inline-block max-w-[160px] truncate rounded-lg bg-blue-50 px-2 py-0.5 text-[11px] font-medium text-[#1E88E5]" title={projectName}>
+    <span className="inline-block max-w-[160px] truncate rounded-lg bg-blue-50 px-2 py-0.5 text-[11px] font-normal text-[#1E88E5]" title={projectName}>
       {projectName}
     </span>
   );
@@ -579,6 +744,9 @@ function MyWorkProjectTasksPanel({
           return compareDateValue(a.start, b.start, dir, sortDir);
         case 'end':
           return compareDateValue(a.end, b.end, dir, sortDir);
+        case 'revised':
+        case 'revisedCount':
+          return compareNumber(a.revisedCount, b.revisedCount, dir);
         case 'delay':
           return compareNumber(parseDelayDays(a), parseDelayDays(b), dir);
         case 'status':
@@ -611,9 +779,11 @@ function MyWorkProjectTasksPanel({
     { key: 'assignee', label: 'Assignee', filter: 'assignee' },
     { key: 'start', label: 'Start' },
     { key: 'end', label: 'End' },
+    { key: 'revised', label: 'Revised' },
     { key: 'delay', label: 'Delay' },
     { key: 'status', label: 'Status', filter: 'status' },
   ];
+  const nestedColSpan = NESTED_COLUMNS.length;
 
   const columnFilterProps = {
     name: { filterValue: nameFilter, onFilterChange: setNameFilter, filterOptions: nameOptions },
@@ -672,7 +842,7 @@ function MyWorkProjectTasksPanel({
             <tbody>
               {sorted.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="px-3 py-6 text-center text-xs text-slate-500">
+                  <td colSpan={nestedColSpan} className="px-3 py-6 text-center text-xs text-slate-500">
                     No tasks match these filters.
                   </td>
                 </tr>
@@ -705,7 +875,7 @@ function MyWorkProjectTasksPanel({
                               iconClass="text-sm"
                             />
                             <div className="min-w-0">
-                              <p className="text-[11px] font-medium text-slate-800">{task.name}</p>
+                              <p className="text-[11px] font-normal text-slate-800">{task.name}</p>
                               {hasExistingSubtasks ? (
                                 <p className="text-[10px] font-medium text-[#FB8C00]">
                                   {childSubtasks.length} subtask{childSubtasks.length === 1 ? '' : 's'}
@@ -715,15 +885,25 @@ function MyWorkProjectTasksPanel({
                           </div>
                         </td>
                         <td className="px-3 py-2">
-                          <div className="flex items-center gap-1.5">
-                            <span className="flex h-6 w-6 items-center justify-center rounded-full bg-blue-100 text-[9px] font-bold text-blue-700">
-                              {task.initials}
-                            </span>
-                            <span className="max-w-[120px] truncate text-[11px] text-slate-700">{task.assignee}</span>
-                          </div>
+                          <PtUserAvatar
+                            name={task.assignee}
+                            initials={task.initials}
+                            sizeClass="h-6 w-6"
+                            textClass="text-[9px]"
+                          />
                         </td>
                         <td className="whitespace-nowrap px-3 py-2 text-[11px] text-slate-700">{task.start}</td>
                         <td className="whitespace-nowrap px-3 py-2 text-[11px] text-slate-700">{task.end}</td>
+                        <td className="px-3 py-2">
+                          {Number(task.revisedCount) > 0 ? (
+                            <span className="inline-flex items-center gap-1 rounded-full bg-orange-50 px-2 py-0.5 text-[10px] font-semibold text-[#FB8C00]">
+                              <i className="ri-refresh-line text-[10px]" />
+                              {task.revisedCount}x
+                            </span>
+                          ) : (
+                            <span className="text-[10px] text-slate-400">—</span>
+                          )}
+                        </td>
                         <td className="px-3 py-2">
                           <span
                             className={`inline-flex whitespace-nowrap rounded-full px-2 py-0.5 text-[10px] font-semibold ${
@@ -741,7 +921,7 @@ function MyWorkProjectTasksPanel({
                       </tr>
                       {showNested && isExpanded ? (
                         <tr className="border-t border-slate-100 bg-slate-50/80">
-                          <td colSpan={6} className="px-3 py-3">
+                          <td colSpan={nestedColSpan} className="px-3 py-3">
                             <UsptTaskSubtasksPanel
                               task={task}
                               processSubtasks={processSubtasks}
@@ -999,7 +1179,7 @@ export default function UserSpecificPT({ useLayout = false }) {
   };
 
   const cachedTasksInit = readSessionJson('userSpecificPT:tasks');
-  const cachedProjectsInit = readSessionJson('userSpecificPT:projects');
+  const cachedProjectsInit = readSessionJson('userSpecificPT:projects:v2');
 
   const [scope, setScope] = useState('My Work');
   const [mode, setMode] = useState('Tasks');
@@ -1016,6 +1196,9 @@ export default function UserSpecificPT({ useLayout = false }) {
   const [myTeamTasks, setMyTeamTasks] = useState([]);
   const [myTeamTasksLoading, setMyTeamTasksLoading] = useState(false);
   const [myTeamTasksError, setMyTeamTasksError] = useState(null);
+  const [myTeamSubtasks, setMyTeamSubtasks] = useState([]);
+  const [myTeamSubtasksLoading, setMyTeamSubtasksLoading] = useState(false);
+  const [myTeamSubtasksError, setMyTeamSubtasksError] = useState(null);
   /** My Work → Tasks: same Assigned / Created split as UserHubTasksPage */
   const [taskOwnershipScope, setTaskOwnershipScope] = useState('assigned');
   const [assignedStatus, setAssignedStatus] = useState('open');
@@ -1034,19 +1217,29 @@ export default function UserSpecificPT({ useLayout = false }) {
     assignedClosed: 0,
   });
   const [hubStatusCounts, setHubStatusCounts] = useState(EMPTY_HUB_STATUS_COUNTS);
-  const [dateFrom, setDateFrom] = useState('');
-  const [dateTo, setDateTo] = useState('');
-  const [createdYear, setCreatedYear] = useState('');
-  const [createdPeriod, setCreatedPeriod] = useState('');
+  const [selectedDraftIds, setSelectedDraftIds] = useState(() => new Set());
+  const [deletingDrafts, setDeletingDrafts] = useState(false);
+  const emptyPeriod = getEmptyPeriodState();
+  const [periodMode, setPeriodMode] = useState(emptyPeriod.mode);
+  const [periodFrom, setPeriodFrom] = useState(emptyPeriod.range.from);
+  const [periodTo, setPeriodTo] = useState(emptyPeriod.range.to);
+  const [periodLabel, setPeriodLabel] = useState(emptyPeriod.summaryLabel);
+  const [periodRanges, setPeriodRanges] = useState([]);
+  const [periodParts, setPeriodParts] = useState([]);
+  const [periodFyStartYear, setPeriodFyStartYear] = useState(null);
   const [companyFilter, setCompanyFilter] = useState('');
   const [lineOfBusinessFilter, setLineOfBusinessFilter] = useState('');
   const [functionTypeFilter, setFunctionTypeFilter] = useState('');
-  const [statusFilter, setStatusFilter] = useState('all');
+  const [statusFilter, setStatusFilter] = useState(USPT_DEFAULT_TABLE_FILTERS.statusFilter);
   const [search, setSearch] = useState('');
-  const [ownerOrProjectFilter, setOwnerOrProjectFilter] = useState('all'); // tasks: project, projects: owner
-  const [priorityOrHealthFilter, setPriorityOrHealthFilter] = useState('all'); // tasks: priority, projects: health
-  const [nameFilter, setNameFilter] = useState('all');
-  const [assigneeFilter, setAssigneeFilter] = useState('all');
+  const [ownerOrProjectFilter, setOwnerOrProjectFilter] = useState(
+    USPT_DEFAULT_TABLE_FILTERS.ownerOrProjectFilter,
+  ); // tasks: project, projects: owner
+  const [priorityOrHealthFilter, setPriorityOrHealthFilter] = useState(
+    USPT_DEFAULT_TABLE_FILTERS.priorityOrHealthFilter,
+  ); // tasks: priority, projects: health
+  const [nameFilter, setNameFilter] = useState(USPT_DEFAULT_TABLE_FILTERS.nameFilter);
+  const [assigneeFilter, setAssigneeFilter] = useState(USPT_DEFAULT_TABLE_FILTERS.assigneeFilter);
   const [sortKey, setSortKey] = useState('name');
   const [sortDir, setSortDir] = useState('asc');
   const [expandedProjectId, setExpandedProjectId] = useState(null);
@@ -1057,26 +1250,131 @@ export default function UserSpecificPT({ useLayout = false }) {
   const [detailModal, setDetailModal] = useState(null);
   const [tablePage, setTablePage] = useState(1);
   const [insightFocus, setInsightFocus] = useState(null);
+  const [pageFiltersReady, setPageFiltersReady] = useState(false);
   const tableSectionRef = useRef(null);
   const insightPulseTimerRef = useRef(null);
   const headerStickyRef = useRef(null);
+  const pageFiltersCacheRef = useRef(null);
+  const skipNextViewFilterResetRef = useRef(false);
+  const didRestoreTableScrollRef = useRef(false);
 
   const isMyWork = scope === 'My Work';
   const isMyWorkTasksHub = isMyWork && mode === 'Tasks';
+
+  const applyUsptTableFilters = useCallback((source) => {
+    const next = pickUsptTableFilters(source);
+    setNameFilter(next.nameFilter);
+    setOwnerOrProjectFilter(next.ownerOrProjectFilter);
+    setAssigneeFilter(next.assigneeFilter);
+    setPriorityOrHealthFilter(next.priorityOrHealthFilter);
+    setStatusFilter(next.statusFilter);
+    setTaskOwnershipScope(next.taskOwnershipScope);
+    setAssignedStatus(next.assignedStatus);
+    setCreatedStatusFilter(next.createdStatusFilter);
+  }, []);
+
+  // Restore table filters from Kissflow global `PageFilters` on mount / refresh.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const saved = await readUsptPageFilters(kfInstance);
+      if (cancelled) return;
+      if (saved) {
+        pageFiltersCacheRef.current = saved;
+        const nextScope = saved.scope === 'My Team' || saved.scope === 'My Work' ? saved.scope : null;
+        const nextMode =
+          saved.mode === 'Projects' || saved.mode === 'Tasks' || saved.mode === 'SubTasks'
+            ? saved.mode
+            : null;
+        const viewScope = nextScope || 'My Work';
+        const viewMode = nextMode || 'Tasks';
+        const viewKey = usptPageFiltersViewKey(viewScope, viewMode);
+        const viewFilters =
+          saved.byView?.[viewKey] ||
+          (saved.nameFilter != null ||
+          saved.ownerOrProjectFilter != null ||
+          saved.assigneeFilter != null
+            ? saved
+            : null);
+        // Prevent the scope/mode effect from wiping restored filters on first ready tick.
+        skipNextViewFilterResetRef.current = true;
+        if (nextScope) setScope(nextScope);
+        if (nextMode) setMode(nextMode);
+        if (viewFilters) applyUsptTableFilters(viewFilters);
+      }
+      if (!cancelled) setPageFiltersReady(true);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [kfInstance, applyUsptTableFilters]);
+
+  // When switching My Work / My Team or Tasks / Projects, restore that view's saved filters.
+  useEffect(() => {
+    if (!pageFiltersReady) return;
+    if (skipNextViewFilterResetRef.current) {
+      skipNextViewFilterResetRef.current = false;
+      setSortKey('name');
+      setSortDir('asc');
+      return;
+    }
+    const viewKey = usptPageFiltersViewKey(scope, mode);
+    const viewFilters = pageFiltersCacheRef.current?.byView?.[viewKey];
+    applyUsptTableFilters(viewFilters || USPT_DEFAULT_TABLE_FILTERS);
+    setSortKey('name');
+    setSortDir('asc');
+  }, [scope, mode, pageFiltersReady, applyUsptTableFilters]);
+
+  // Persist active table filters into Kissflow global `PageFilters`.
+  useEffect(() => {
+    if (!pageFiltersReady || !kfInstance) return;
+    const viewKey = usptPageFiltersViewKey(scope, mode);
+    const viewFilters = pickUsptTableFilters({
+      nameFilter,
+      ownerOrProjectFilter,
+      assigneeFilter,
+      priorityOrHealthFilter,
+      statusFilter,
+      taskOwnershipScope,
+      assignedStatus,
+      createdStatusFilter,
+    });
+    const snapshot = {
+      v: 1,
+      scope,
+      mode,
+      byView: {
+        ...(pageFiltersCacheRef.current?.byView || {}),
+        [viewKey]: viewFilters,
+      },
+    };
+    pageFiltersCacheRef.current = snapshot;
+    const timer = setTimeout(() => {
+      void writeUsptPageFilters(kfInstance, snapshot);
+    }, 200);
+    return () => clearTimeout(timer);
+  }, [
+    pageFiltersReady,
+    kfInstance,
+    scope,
+    mode,
+    nameFilter,
+    ownerOrProjectFilter,
+    assigneeFilter,
+    priorityOrHealthFilter,
+    statusFilter,
+    taskOwnershipScope,
+    assignedStatus,
+    createdStatusFilter,
+  ]);
 
   useEffect(() => {
     setExpandedProjectId(null);
     setExpandedTaskIds(new Set());
     setDetailModal(null);
     setTablePage(1);
-  }, [scope, mode, search, statusFilter, ownerOrProjectFilter, priorityOrHealthFilter, dateFrom, dateTo, createdYear, createdPeriod, nameFilter, assigneeFilter, taskOwnershipScope, assignedStatus, createdStatusFilter]);
-
-  useEffect(() => {
-    setNameFilter('all');
-    setAssigneeFilter('all');
-    setSortKey('name');
-    setSortDir('asc');
-  }, [scope, mode]);
+    setSelectedDraftIds(new Set());
+  }, [scope, mode, search, statusFilter, ownerOrProjectFilter, priorityOrHealthFilter, periodFrom, periodTo, periodMode, nameFilter, assigneeFilter, taskOwnershipScope, assignedStatus, createdStatusFilter]);
 
   useEffect(() => () => {
     if (insightPulseTimerRef.current) clearTimeout(insightPulseTimerRef.current);
@@ -1086,7 +1384,12 @@ export default function UserSpecificPT({ useLayout = false }) {
     const align = () => {
       const el = tableSectionRef.current;
       if (!el) return;
-      const headerH = headerStickyRef.current?.getBoundingClientRect().height ?? 0;
+      // Header is sticky only from sm+; skip sticky offset on mobile.
+      const stickyHeader =
+        typeof window !== 'undefined' && window.matchMedia('(min-width: 640px)').matches;
+      const headerH = stickyHeader
+        ? (headerStickyRef.current?.getBoundingClientRect().height ?? 0)
+        : 0;
       const gap = 16;
       const offset = headerH + gap;
       const root = typeof document !== 'undefined' ? document.querySelector('.rootDiv') : null;
@@ -1241,6 +1544,70 @@ export default function UserSpecificPT({ useLayout = false }) {
     pulseTableHighlight(`hub-created-${next}`, `Created · ${next}`);
   }, [pulseTableHighlight]);
 
+  const showDraftBulkSelect =
+    isMyWorkTasksHub && taskOwnershipScope === 'created' && createdStatusFilter === 'Draft';
+
+  const handleToggleDraftSelect = useCallback((id) => {
+    if (!id) return;
+    setSelectedDraftIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const handleToggleAllDraftsSelect = useCallback((checked, pageRowIds) => {
+    setSelectedDraftIds((prev) => {
+      const next = new Set(prev);
+      (pageRowIds || []).forEach((id) => {
+        if (checked) next.add(id);
+        else next.delete(id);
+      });
+      return next;
+    });
+  }, []);
+
+  const handleDeleteDrafts = useCallback(async () => {
+    const ids = Array.from(selectedDraftIds).filter(Boolean);
+    if (!ids.length || !kfInstance) return;
+    const confirmed = window.confirm(`Delete ${ids.length} selected draft task(s)? This cannot be undone.`);
+    if (!confirmed) return;
+
+    setDeletingDrafts(true);
+    try {
+      const { successIds, failed } = await deleteTaskDraftRecords(kfInstance, ids);
+      if (successIds.length) {
+        setHubTableTasks((prev) =>
+          prev.filter((row) => !successIds.includes(resolveTaskDraftDeleteId(row))),
+        );
+        setSelectedDraftIds((prev) => {
+          const next = new Set(prev);
+          successIds.forEach((id) => next.delete(id));
+          return next;
+        });
+        setHubStatusCounts((prev) => ({
+          ...prev,
+          Draft: Math.max(0, (prev.Draft || 0) - successIds.length),
+        }));
+        setHubTaskCounts((prev) => ({
+          ...prev,
+          created: Math.max(0, prev.created - successIds.length),
+        }));
+      }
+      if (failed > 0) {
+        window.alert(`${successIds.length} draft(s) deleted, ${failed} failed.`);
+      } else if (successIds.length) {
+        window.alert(`${successIds.length} draft(s) deleted successfully.`);
+      }
+    } catch (e) {
+      console.warn('USPT draft delete failed:', e?.message || e);
+      window.alert('Delete failed. Please try again.');
+    } finally {
+      setDeletingDrafts(false);
+    }
+  }, [kfInstance, selectedDraftIds]);
+
   useEffect(() => {
     if (!isMyWorkTasksHub) return undefined;
     loadHubTableTasks();
@@ -1392,11 +1759,11 @@ export default function UserSpecificPT({ useLayout = false }) {
             const tasksRaw = (await fetchTaskTrackerData(kfInstance, { enrichDetails: false })).map(
               mapTaskForUserSpecificPT,
             );
-            if (cancelled) return;
-            setApiTasks(tasksRaw);
-            try {
-              sessionStorage.setItem('userSpecificPT:tasks', JSON.stringify(tasksRaw));
-            } catch { /* ignore */ }
+        if (cancelled) return;
+        setApiTasks(tasksRaw);
+        try {
+          sessionStorage.setItem('userSpecificPT:tasks', JSON.stringify(tasksRaw));
+        } catch { /* ignore */ }
           } catch (err) {
             console.warn('UserSpecificPT: background tracker fetch failed', err?.message || err);
           } finally {
@@ -1475,6 +1842,9 @@ export default function UserSpecificPT({ useLayout = false }) {
             start: p.startDate ? String(p.startDate) : '—',
             revisedEndDate: p.revisedEndDate || null,
             originalEndDate: p.originalEndDate || null,
+            revisedCount: Number(p.revisedCount ?? 0) || 0,
+            hasRevision: Boolean(p.hasRevision) || Number(p.revisedCount ?? 0) > 0,
+            revisionHistory: Array.isArray(p.revisionHistory) ? p.revisionHistory : [],
             status: p.status,
             rag: p.rag,
             createdAt: p.createdAt || null,
@@ -1483,7 +1853,7 @@ export default function UserSpecificPT({ useLayout = false }) {
         });
         setApiProjects(projectsMapped);
         try {
-          sessionStorage.setItem('userSpecificPT:projects', JSON.stringify(projectsMapped));
+          sessionStorage.setItem('userSpecificPT:projects:v2', JSON.stringify(projectsMapped));
         } catch { /* ignore */ }
         setApiProjectsLoading(false);
       } catch (err) {
@@ -1510,10 +1880,9 @@ export default function UserSpecificPT({ useLayout = false }) {
         scope,
         mode,
         selectedMembers.join('|'),
-        dateFrom,
-        dateTo,
-        createdYear,
-        createdPeriod,
+        periodMode,
+        periodFrom,
+        periodTo,
         companyFilter,
         lineOfBusinessFilter,
         functionTypeFilter,
@@ -1526,10 +1895,9 @@ export default function UserSpecificPT({ useLayout = false }) {
       scope,
       mode,
       selectedMembers,
-      dateFrom,
-      dateTo,
-      createdYear,
-      createdPeriod,
+      periodMode,
+      periodFrom,
+      periodTo,
       companyFilter,
       lineOfBusinessFilter,
       functionTypeFilter,
@@ -1549,8 +1917,9 @@ export default function UserSpecificPT({ useLayout = false }) {
       if (!kfInstance?.user) return;
 
       const emailKey = String(userEmail || userId || 'me').toLowerCase();
-      const projectsCacheKey = `userSpecificPT:myTeamProjects:v5:${emailKey}`;
-      const tasksCacheKey = `userSpecificPT:myTeamTasks:v5:${emailKey}`;
+      const projectsCacheKey = `userSpecificPT:myTeamProjects:v6:${emailKey}`;
+      const tasksCacheKey = `userSpecificPT:myTeamTasks:v6:${emailKey}`;
+      const subtasksCacheKey = `userSpecificPT:myTeamSubtasks:v2:${emailKey}`;
 
       let hasProjectsCache = false;
       try {
@@ -1561,10 +1930,19 @@ export default function UserSpecificPT({ useLayout = false }) {
         }
       } catch { /* ignore */ }
 
+      try {
+        const cachedSubs = JSON.parse(sessionStorage.getItem(subtasksCacheKey) || 'null');
+        if (Array.isArray(cachedSubs) && cachedSubs.length > 0) {
+          setMyTeamSubtasks(cachedSubs);
+        }
+      } catch { /* ignore */ }
+
       if (!hasProjectsCache) setMyTeamProjectsLoading(true);
       setMyTeamTasksLoading(true);
+      setMyTeamSubtasksLoading(true);
       setMyTeamProjectsError(null);
       setMyTeamTasksError(null);
+      setMyTeamSubtasksError(null);
 
       try {
         const { projects } = await fetchMyTeamProjects(kfInstance, {
@@ -1589,14 +1967,24 @@ export default function UserSpecificPT({ useLayout = false }) {
           });
         });
 
-        const { tasks } = await fetchMyTeamTasks(kfInstance, {
-          loggedInEmail: userEmail,
-          allowedProjectIds,
-        });
+        const [{ tasks }, { subtasks }] = await Promise.all([
+          fetchMyTeamTasks(kfInstance, {
+            loggedInEmail: userEmail,
+            allowedProjectIds,
+          }),
+          fetchMyTeamSubtasks(kfInstance, {
+            loggedInEmail: userEmail,
+            allowedProjectIds,
+          }),
+        ]);
         if (cancelled) return;
         setMyTeamTasks(tasks);
+        setMyTeamSubtasks(subtasks);
         try {
           sessionStorage.setItem(tasksCacheKey, JSON.stringify(tasks));
+        } catch { /* ignore */ }
+        try {
+          sessionStorage.setItem(subtasksCacheKey, JSON.stringify(subtasks));
         } catch { /* ignore */ }
       } catch (e) {
         console.warn('UserSpecificPT: My Team fetch failed', e);
@@ -1604,13 +1992,16 @@ export default function UserSpecificPT({ useLayout = false }) {
           const msg = e?.message || 'Failed to load My Team data';
           setMyTeamProjectsError(msg);
           setMyTeamTasksError(msg);
+          setMyTeamSubtasksError(msg);
           if (!hasProjectsCache) setMyTeamProjects([]);
           setMyTeamTasks([]);
+          setMyTeamSubtasks([]);
         }
       } finally {
         if (!cancelled) {
           setMyTeamProjectsLoading(false);
           setMyTeamTasksLoading(false);
+          setMyTeamSubtasksLoading(false);
         }
       }
     }
@@ -1620,6 +2011,19 @@ export default function UserSpecificPT({ useLayout = false }) {
   }, [scope, kfInstance, userEmail, userId]);
 
   const current = useMemo(() => {
+    if (mode === 'SubTasks') {
+      return {
+        isTasks: false,
+        isTeam: false,
+        rows: [],
+        optionRows: [],
+        total: 0,
+        kpis: [],
+        legend: [],
+        hubLoading: false,
+      };
+    }
+
     const isTeam = scope === 'My Team';
     const isTasks = mode === 'Tasks';
 
@@ -1629,21 +2033,7 @@ export default function UserSpecificPT({ useLayout = false }) {
     const pctOf = (n, total) => (total > 0 ? Number(((n / total) * 100).toFixed(1)) : 0);
     const pctRound = (n, total) => (total > 0 ? Math.round((n / total) * 100) : 0);
 
-    const inDateRange = (dLike) => {
-      const from = dateFrom ? parseKfDate(dateFrom) : null;
-      const to = dateTo ? parseKfDate(dateTo) : null;
-      const d = parseKfDate(dLike);
-      if (!d) return true;
-      if (from && d < from) return false;
-      if (to) {
-        const endOfDay = new Date(to);
-        endOfDay.setHours(23, 59, 59, 999);
-        if (d > endOfDay) return false;
-      }
-      return true;
-    };
-
-    const createdRange = resolveCreatedDateRange(createdYear, createdPeriod);
+    const createdRanges = resolveUsptPeriodCreatedRanges(periodFrom, periodTo, periodRanges);
     const dimensionFilters = {
       company: companyFilter,
       lineOfBusiness: lineOfBusinessFilter,
@@ -1705,17 +2095,24 @@ export default function UserSpecificPT({ useLayout = false }) {
           ? baseTasks.filter((t) =>
               personMatches(kfUser, { id: t.assigneeId, email: t.assigneeEmail, name: t.assignee }),
             )
-          : baseTasks;
+        : baseTasks;
 
       let tasks =
         isTeam && selectedMembers.length > 0
           ? myTasks.filter((t) => selectedMembers.includes(String(t.assignee || '').trim()))
           : myTasks;
 
-      const applySharedTaskFilters = (list, { applyStatus = true } = {}) => {
+      const applySharedTaskFilters = (
+        list,
+        {
+          applyStatus = true,
+          applyProject = true,
+          applyPriority = true,
+          applySearch = true,
+        } = {},
+      ) => {
         let next = list;
-        next = next.filter((t) => inDateRange(t.start) || inDateRange(t.end));
-        next = next.filter((t) => matchesCreatedDateRange(t, createdRange));
+        next = next.filter((t) => rowMatchesAnyCreatedRange(t, createdRanges));
         next = next.filter((t) =>
           taskMatchesPortfolioDimensions(t, dimensionFilters, dimensionScopedProjects),
         );
@@ -1746,19 +2143,31 @@ export default function UserSpecificPT({ useLayout = false }) {
           }
         }
 
-        if (ownerOrProjectFilter === '__individual__') {
-          next = next.filter((t) => isEmptyProjectName(t.project));
-        } else if (ownerOrProjectFilter !== 'all') {
-          next = next.filter((t) => String(t.project || '').trim() === ownerOrProjectFilter);
+        if (applyProject) {
+          if (ownerOrProjectFilter === '__individual__') {
+            next = next.filter((t) => isEmptyProjectName(t.project));
+          } else if (ownerOrProjectFilter !== 'all') {
+            next = next.filter((t) => String(t.project || '').trim() === ownerOrProjectFilter);
+          }
         }
 
-        if (priorityOrHealthFilter !== 'all') {
+        if (applyPriority && priorityOrHealthFilter !== 'all') {
           next = next.filter((t) => String(t.priority || '').trim() === priorityOrHealthFilter);
         }
 
-        next = next.filter((t) => matchesSearch(`${t.name} ${t.id} ${t.project} ${t.assignee} ${t.status}`));
+        if (applySearch) {
+          next = next.filter((t) => matchesSearch(`${t.name} ${t.id} ${t.project} ${t.assignee} ${t.status}`));
+        }
         return next;
       };
+
+      // Column filter menus must use pre-column-filter rows, otherwise selecting
+      // "Asset management" collapses Project options to only that one value.
+      const optionRows = applySharedTaskFilters(tasks, {
+        applyStatus: false,
+        applyProject: false,
+        applyPriority: false,
+      });
 
       tasks = applySharedTaskFilters(tasks);
 
@@ -1809,6 +2218,7 @@ export default function UserSpecificPT({ useLayout = false }) {
         isTasks,
         isTeam,
         rows: tasks,
+        optionRows,
         total: tableTotal,
         metricsTotal: total,
         completedCount,
@@ -1886,6 +2296,7 @@ export default function UserSpecificPT({ useLayout = false }) {
         isTasks,
         isTeam,
         rows: [],
+        optionRows: [],
         total: 0,
         completedCount: 0,
         pendingCount: 0,
@@ -1902,8 +2313,12 @@ export default function UserSpecificPT({ useLayout = false }) {
     let projects = dimensionScopedProjects.slice();
 
     // Date range: include project if start OR end falls in range.
-    projects = projects.filter((p) => inDateRange(p.start) || inDateRange(p.end));
-    projects = projects.filter((p) => matchesCreatedDateRange(p, createdRange));
+    projects = projects.filter((p) => rowMatchesAnyCreatedRange(p, createdRanges));
+
+    // Column menus use rows before owner/health/status filters (same bug as Project on Tasks).
+    const optionRows = projects.filter((p) =>
+      matchesSearch(`${p.name} ${p.id} ${p.owner} ${p.health} ${p.status}`),
+    );
 
     // Status filter (match either health or raw status)
     // Status / health filter (supports KPI tokens)
@@ -1948,6 +2363,7 @@ export default function UserSpecificPT({ useLayout = false }) {
       isTasks,
       isTeam,
       rows: projects,
+      optionRows,
       total,
       onTrackCount,
       atRiskCount,
@@ -2020,10 +2436,9 @@ export default function UserSpecificPT({ useLayout = false }) {
     hubTableTasksLoading,
     taskOwnershipScope,
     kfInstance,
-    dateFrom,
-    dateTo,
-    createdYear,
-    createdPeriod,
+    periodFrom,
+    periodTo,
+    periodRanges,
     companyFilter,
     lineOfBusinessFilter,
     functionTypeFilter,
@@ -2031,6 +2446,56 @@ export default function UserSpecificPT({ useLayout = false }) {
     search,
     ownerOrProjectFilter,
     priorityOrHealthFilter,
+  ]);
+
+  // After Kissflow remounts (popup close refresh), return the user to the tasks/projects table.
+  useEffect(() => {
+    if (!pageFiltersReady || didRestoreTableScrollRef.current) return;
+
+    const tableBusy =
+      Boolean(current.hubLoading) ||
+      (scope === 'My Team' && mode === 'Tasks' && myTeamTasksLoading) ||
+      (scope === 'My Team' && mode === 'Projects' && myTeamProjectsLoading) ||
+      (scope === 'My Work' && mode === 'Projects' && apiProjectsLoading);
+
+    if (tableBusy) return;
+
+    const fromPopup = peekUsptReturnToTable();
+    const fromActiveFilters =
+      nameFilter !== 'all' ||
+      ownerOrProjectFilter !== 'all' ||
+      assigneeFilter !== 'all' ||
+      priorityOrHealthFilter !== 'all' ||
+      (statusFilter !== 'all' && statusFilter !== USPT_DEFAULT_TABLE_FILTERS.statusFilter);
+
+    if (!fromPopup && !fromActiveFilters) {
+      didRestoreTableScrollRef.current = true;
+      return;
+    }
+
+    didRestoreTableScrollRef.current = true;
+    clearUsptReturnToTable();
+    // Let restored filters + table paint first.
+    const t1 = window.setTimeout(() => scrollToTable(), 60);
+    const t2 = window.setTimeout(() => scrollToTable(), 320);
+    return () => {
+      window.clearTimeout(t1);
+      window.clearTimeout(t2);
+    };
+  }, [
+    pageFiltersReady,
+    current.hubLoading,
+    scope,
+    mode,
+    myTeamTasksLoading,
+    myTeamProjectsLoading,
+    apiProjectsLoading,
+    nameFilter,
+    ownerOrProjectFilter,
+    assigneeFilter,
+    priorityOrHealthFilter,
+    statusFilter,
+    scrollToTable,
   ]);
 
   const portfolioDimensionSource = useMemo(() => {
@@ -2096,29 +2561,45 @@ export default function UserSpecificPT({ useLayout = false }) {
       company: companyFilter,
       lineOfBusiness: lineOfBusinessFilter,
       functionType: functionTypeFilter,
-    }) || Boolean(createdYear);
+    }) || Boolean(periodFrom && periodTo && periodMode !== 'all') || (Array.isArray(periodRanges) && periodRanges.length > 0 && periodMode !== 'all');
 
   const clearDimensionFilters = useCallback(() => {
+    const empty = getEmptyPeriodState();
     setCompanyFilter('');
     setLineOfBusinessFilter('');
     setFunctionTypeFilter('');
-    setCreatedYear('');
-    setCreatedPeriod('');
+    setPeriodMode(empty.mode);
+    setPeriodFrom(empty.range.from);
+    setPeriodTo(empty.range.to);
+    setPeriodLabel(empty.summaryLabel);
+    setPeriodRanges([]);
+    setPeriodParts([]);
+    setPeriodFyStartYear(null);
   }, []);
 
-  const createdYearOptions = useMemo(() => {
-    const rows =
-      mode === 'Tasks'
-        ? (scope === 'My Team'
-          ? myTeamTasks
-          : (isMyWorkTasksHub ? hubTasksWithProjects : apiTasks))
-        : (scope === 'My Team' ? myTeamProjects : apiProjects);
-    return buildCreatedYearOptions(rows);
-  }, [mode, scope, isMyWorkTasksHub, apiTasks, apiProjects, myTeamTasks, myTeamProjects, hubTasksWithProjects]);
+  const handlePeriodChange = useCallback((next) => {
+    const period = next && typeof next === 'object' ? next : getEmptyPeriodState();
+    setPeriodMode(period.mode || 'all');
+    setPeriodFrom(period.range?.from || '');
+    setPeriodTo(period.range?.to || '');
+    setPeriodLabel(period.summaryLabel || 'All time');
+    setPeriodRanges(Array.isArray(period.ranges) ? period.ranges : []);
+    setPeriodParts(Array.isArray(period.parts) ? period.parts : []);
+    setPeriodFyStartYear(
+      Number.isFinite(Number(period.fyStartYear)) ? Number(period.fyStartYear) : null,
+    );
+  }, []);
 
-  const createdPeriodOptions = useMemo(
-    () => getCreatedPeriodOptions(createdYear),
-    [createdYear],
+  const periodPickerState = useMemo(
+    () => ({
+      mode: periodMode || 'all',
+      range: { from: periodFrom || '', to: periodTo || '' },
+      ranges: periodRanges,
+      parts: periodParts,
+      fyStartYear: periodFyStartYear,
+      summaryLabel: periodLabel || 'All time',
+    }),
+    [periodMode, periodFrom, periodTo, periodRanges, periodParts, periodFyStartYear, periodLabel],
   );
 
   const teamOverviewRows = useMemo(() => {
@@ -2194,16 +2675,24 @@ export default function UserSpecificPT({ useLayout = false }) {
       const rows =
         mode === 'Tasks'
           ? (Array.isArray(myTeamTasks) ? myTeamTasks : [])
-          : (Array.isArray(myTeamProjects) ? myTeamProjects : []);
+          : mode === 'SubTasks'
+            ? (Array.isArray(myTeamSubtasks) ? myTeamSubtasks : [])
+            : (Array.isArray(myTeamProjects) ? myTeamProjects : []);
 
       const unique = new Map();
       rows.forEach((row) => {
         const name = String(
-          mode === 'Tasks' ? row?.assignee : row?.owner,
+          mode === 'Tasks' || mode === 'SubTasks'
+            ? (row?.assignee || row?.assignedTo)
+            : row?.owner,
         ).trim();
         if (!name || name === '—') return;
-        const id = String(mode === 'Tasks' ? row?.assigneeId : row?.ownerId || '').trim();
-        const email = String(mode === 'Tasks' ? row?.assigneeEmail : row?.ownerEmail || '').trim();
+        const id = String(
+          mode === 'Tasks' || mode === 'SubTasks' ? row?.assigneeId : row?.ownerId || '',
+        ).trim();
+        const email = String(
+          mode === 'Tasks' || mode === 'SubTasks' ? row?.assigneeEmail : row?.ownerEmail || '',
+        ).trim();
         const key = id || name.toLowerCase();
         if (!unique.has(key)) {
           unique.set(key, { name, initials: toInitials(name), id, email });
@@ -2211,7 +2700,11 @@ export default function UserSpecificPT({ useLayout = false }) {
       });
 
       const counts = rows.reduce((acc, row) => {
-        const name = String(mode === 'Tasks' ? row?.assignee : row?.owner).trim();
+        const name = String(
+          mode === 'Tasks' || mode === 'SubTasks'
+            ? (row?.assignee || row?.assignedTo)
+            : row?.owner,
+        ).trim();
         if (!name || name === '—') return acc;
         acc[name] = (acc[name] || 0) + 1;
         return acc;
@@ -2236,7 +2729,7 @@ export default function UserSpecificPT({ useLayout = false }) {
       return acc;
     }, {});
     return Array.from(unique.values()).sort((a, b) => (counts[b.name] || 0) - (counts[a.name] || 0));
-  }, [apiTasks, myTeamTasks, myTeamProjects, scope, mode]);
+  }, [apiTasks, myTeamTasks, myTeamProjects, myTeamSubtasks, scope, mode]);
 
   useEffect(() => {
     // If selected members are no longer available (org list refreshed), clear invalid selections.
@@ -2275,6 +2768,40 @@ export default function UserSpecificPT({ useLayout = false }) {
       return true;
     },
     [],
+  );
+
+  const handleOpenMyTeamSubtaskDetail = useCallback(
+    async (row) => {
+      if (!row) return false;
+      const instanceId = String(row.InstanceID || row._id || row.id || '').trim();
+      // Prefer full admin detail so popup can show the API field set.
+      if (instanceId && kfInstance?.api) {
+        try {
+          const detail = await fetchSubtaskAdminDetailById(kfInstance, instanceId);
+          const detailRow = detail && typeof detail === 'object' ? detail : null;
+          if (detailRow && (detailRow._id || detailRow.Sub_task_Name || detailRow.Name)) {
+            const activityFromList = row.ActivityID || row._activity_instance_id;
+            setDetailModal({
+              type: 'subtask',
+              row: mapUsptSubtaskToDetailRow({
+                ...row,
+                raw: {
+                  ...detailRow,
+                  _activity_instance_id:
+                    detailRow._activity_instance_id || activityFromList || undefined,
+                },
+              }),
+            });
+            return true;
+          }
+        } catch (e) {
+          console.warn('My Team subtask detail fetch failed; using report row', e?.message || e);
+        }
+      }
+      setDetailModal({ type: 'subtask', row: mapUsptSubtaskToDetailRow(row) });
+      return true;
+    },
+    [kfInstance],
   );
 
   const openUsptSubtaskDetail = useCallback((sub) => {
@@ -2374,27 +2901,46 @@ export default function UserSpecificPT({ useLayout = false }) {
     return sortedTableRows.slice(start, start + PT_TABLE_PAGE_SIZE);
   }, [sortedTableRows, safeTablePage]);
 
+  const draftPageRowIds = useMemo(() => {
+    if (!showDraftBulkSelect) return [];
+    return pageRows.map((row) => resolveTaskDraftDeleteId(row)).filter(Boolean);
+  }, [showDraftBulkSelect, pageRows]);
+
+  const allDraftPageSelected =
+    showDraftBulkSelect &&
+    draftPageRowIds.length > 0 &&
+    draftPageRowIds.every((id) => selectedDraftIds.has(id));
+
   const taskNameOptions = useMemo(
-    () => distinctFilterOptions(current.isTasks ? current.rows : [], (t) => t.name, { allLabel: 'All Tasks' }),
-    [current.isTasks, current.rows],
+    () =>
+      distinctFilterOptions(current.isTasks ? current.optionRows || current.rows : [], (t) => t.name, {
+        allLabel: 'All Tasks',
+      }),
+    [current.isTasks, current.optionRows, current.rows],
   );
   const projectOrOwnerOptions = useMemo(() => {
+    const source = current.optionRows || current.rows || [];
     if (current.isTasks) {
-      return distinctFilterOptions(current.rows, (t) => t.project, {
+      return distinctFilterOptions(source, (t) => t.project, {
         allLabel: 'All Projects',
         emptyValue: '__individual__',
         emptyLabel: 'Individual Task',
       });
     }
-    return distinctFilterOptions(current.rows, (p) => p.owner, { allLabel: 'All Owners' });
-  }, [current.isTasks, current.rows]);
+    return distinctFilterOptions(source, (p) => p.owner, { allLabel: 'All Owners' });
+  }, [current.isTasks, current.optionRows, current.rows]);
   const assigneeOptions = useMemo(
-    () => distinctFilterOptions(current.isTasks ? current.rows : [], (t) => t.assignee, { allLabel: 'All Assignees' }),
-    [current.isTasks, current.rows],
+    () =>
+      distinctFilterOptions(current.isTasks ? current.optionRows || current.rows : [], (t) => t.assignee, {
+        allLabel: 'All Assignees',
+      }),
+    [current.isTasks, current.optionRows, current.rows],
   );
   const priorityOrHealthOptions = useMemo(() => {
     if (current.isTasks) {
-      return distinctFilterOptions(current.rows, (t) => t.priority, { allLabel: 'All Priority' });
+      return distinctFilterOptions(current.optionRows || current.rows || [], (t) => t.priority, {
+        allLabel: 'All Priority',
+      });
     }
     return [
       { value: 'all', label: 'Project Health' },
@@ -2403,14 +2949,20 @@ export default function UserSpecificPT({ useLayout = false }) {
       { value: 'Delayed', label: 'Delayed' },
       { value: 'Completed', label: 'Completed' },
     ];
-  }, [current.isTasks, current.rows]);
+  }, [current.isTasks, current.optionRows, current.rows]);
   const statusColumnOptions = useMemo(
-    () => distinctFilterOptions(current.isTasks ? current.rows : [], (t) => t.status, { allLabel: 'All Status' }),
-    [current.isTasks, current.rows],
+    () =>
+      distinctFilterOptions(current.isTasks ? current.optionRows || current.rows : [], (t) => t.status, {
+        allLabel: 'All Status',
+      }),
+    [current.isTasks, current.optionRows, current.rows],
   );
   const projectNameOptions = useMemo(
-    () => distinctFilterOptions(!current.isTasks ? current.rows : [], (p) => p.name, { allLabel: 'All Projects' }),
-    [current.isTasks, current.rows],
+    () =>
+      distinctFilterOptions(!current.isTasks ? current.optionRows || current.rows : [], (p) => p.name, {
+        allLabel: 'All Projects',
+      }),
+    [current.isTasks, current.optionRows, current.rows],
   );
 
   const mainTableColumns = useMemo(() => {
@@ -2434,9 +2986,12 @@ export default function UserSpecificPT({ useLayout = false }) {
       { key: 'progress', label: 'Progress' },
       { key: 'delay', label: 'Delay' },
       { key: 'end', label: 'End Date' },
+      { key: 'revised', label: 'Revised' },
       { key: 'health', label: 'Health', filter: 'health' },
     ];
   }, [current.isTasks]);
+
+  const mainTableColSpan = mainTableColumns.length + (showDraftBulkSelect ? 1 : 0);
 
   const mainColumnFilterProps = {
     name: {
@@ -2491,126 +3046,151 @@ export default function UserSpecificPT({ useLayout = false }) {
     <div className="min-w-0 bg-gradient-to-b from-[#edf1ff] via-[#f6f8ff] to-[#f2ecff]">
       <div className="min-w-0 p-2 pb-5 sm:p-4 sm:pb-6">
         <div
-          className="sticky top-0 z-30 -mx-2 mb-3 min-w-0 border-b border-slate-200/60 bg-[#edf1ff]/90 px-2 py-2 backdrop-blur-md sm:-mx-4 sm:mb-4 sm:px-4 sm:py-2.5"
+          className="relative z-20 -mx-2 mb-3 min-w-0 overflow-visible border-b border-slate-200/60 bg-[#edf1ff]/95 px-3 py-2.5 sm:sticky sm:top-0 sm:z-30 sm:-mx-4 sm:mb-4 sm:bg-[#edf1ff]/90 sm:px-4 sm:py-2.5 sm:backdrop-blur-md"
           ref={headerStickyRef}
         >
-          <div className="mx-auto flex max-w-[1800px] min-w-0 flex-col gap-2">
-            {/* Identity + scope — one compact row */}
-            <div className="flex min-w-0 flex-wrap items-center gap-2 sm:gap-3">
-              <div className="flex min-w-0 flex-1 items-center gap-2.5">
+          <div className="mx-auto flex max-w-[1800px] min-w-0 flex-col gap-2.5">
+            {/* Identity left · scope / mode controls right (stacked on mobile) */}
+            <div className="flex min-w-0 flex-col gap-2.5 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
+              <div className="hidden min-w-0 items-center gap-2.5 sm:flex sm:max-w-md sm:shrink">
                 <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[#1E62F0] text-sm font-bold text-white shadow-sm">
                   {(userName || 'U').charAt(0)}
                 </div>
-                <div className="min-w-0">
-                  <h1 className="truncate text-sm font-semibold tracking-tight text-slate-900 sm:text-base">
+                <div className="min-w-0 flex-1">
+                  <h1 className="truncate text-base font-semibold leading-snug tracking-tight text-slate-900">
                     {getGreeting()}, {userName}
                   </h1>
-                  <p className="truncate text-[11px] text-slate-500">
-                    Project Manager · {scope === 'My Team' ? 'My Team' : 'My Work'} · {mode}
+                  <p className="mt-0.5 truncate text-[11px] leading-snug text-slate-500">
+                    Project Manager · {scope === 'My Team' ? 'My Team' : 'My Work'} ·{' '}
+                    {mode === 'SubTasks' ? 'Subtasks' : mode}
                   </p>
                 </div>
               </div>
 
-              <div className="inline-flex shrink-0 rounded-lg border border-slate-200/90 bg-white p-0.5 shadow-sm">
-                {['My Work', 'My Team'].map((x) => (
-                  <button
-                    key={x}
-                    onClick={() => {
-                      setScope(x);
-                      if (x === 'My Team') setSelectedMembers([]);
-                    }}
-                    type="button"
-                    className={`rounded-md px-2.5 py-1.5 text-[11px] font-semibold transition-all sm:px-3 ${
-                      scope === x
-                        ? 'bg-[#1E62F0] text-white shadow-sm'
-                        : 'bg-transparent text-slate-600 hover:bg-slate-50'
-                    }`}
-                  >
-                    {x}
-                  </button>
-                ))}
-              </div>
+              <div className="flex w-full min-w-0 flex-col gap-2.5 sm:ml-auto sm:w-auto sm:flex-row sm:flex-wrap sm:items-center sm:justify-end sm:gap-2">
+                <div
+                  className="grid w-full grid-cols-2 gap-0.5 rounded-xl border border-slate-200/90 bg-white p-0.5 shadow-sm sm:inline-flex sm:w-auto sm:shrink-0 sm:rounded-lg"
+                  role="group"
+                  aria-label="Work scope"
+                >
+                  {['My Work', 'My Team'].map((x) => (
+                    <button
+                      key={x}
+                      onClick={() => {
+                        setScope(x);
+                        if (x === 'My Team') setSelectedMembers([]);
+                      }}
+                      type="button"
+                      className={`min-h-[40px] rounded-lg px-2.5 text-[12px] font-semibold transition-all sm:min-h-0 sm:rounded-md sm:px-3 sm:py-1.5 sm:text-[11px] ${
+                        scope === x
+                          ? 'bg-[#1E62F0] text-white shadow-sm'
+                          : 'bg-transparent text-slate-600 hover:bg-slate-50'
+                      }`}
+                    >
+                      {x}
+                    </button>
+                  ))}
+                </div>
 
-              {scope === 'My Team' ? (
-                teamMembers.length > 0 ? (
-                  <PtSelect
-                    value={selectedMembers.length === 1 ? selectedMembers[0] : ''}
-                    onChange={(e) => {
-                      const next = e.target.value;
-                      setSelectedMembers(next ? [next] : []);
-                    }}
-                    leadingIcon="ri-team-line"
-                    aria-label="Filter by team member"
-                    className="min-w-[9.5rem] max-w-[14rem] shrink-0"
-                    triggerClassName="text-xs py-1.5 h-auto min-h-[2rem]"
-                    options={[
-                      { value: '', label: `All Members (${teamMembers.length})` },
-                      ...teamMembers.map((m) => ({ value: m.name, label: m.name })),
-                    ]}
-                  />
-                ) : (
-                  <div className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] font-medium text-slate-500 shadow-sm">
-                    {((mode === 'Tasks' && myTeamTasksLoading) || (mode === 'Projects' && myTeamProjectsLoading)) ? (
-                      <>
-                        <i className="ri-loader-4-line animate-spin" />
-                        Loading…
-                      </>
-                    ) : (
-                      <>
-                        <i className={
-                          (mode === 'Tasks' ? myTeamTasksError : myTeamProjectsError)
-                            ? 'ri-error-warning-line text-rose-500'
-                            : 'ri-user-unfollow-line'
-                        } />
-                        {(mode === 'Tasks' ? myTeamTasksError : myTeamProjectsError)
-                          ? 'Team unavailable'
-                          : 'No members'}
-                      </>
-                    )}
+                {scope === 'My Team' ? (
+                  teamMembers.length > 0 ? (
+                    <PtSelect
+                      value={selectedMembers.length === 1 ? selectedMembers[0] : ''}
+                      onChange={(e) => {
+                        const next = e.target.value;
+                        setSelectedMembers(next ? [next] : []);
+                      }}
+                      leadingIcon="ri-team-line"
+                      aria-label="Filter by team member"
+                      className="w-full min-w-0 sm:min-w-[9.5rem] sm:max-w-[14rem] sm:shrink-0"
+                      triggerClassName="text-xs py-1.5 h-auto min-h-[2.5rem] sm:min-h-[2rem]"
+                      options={[
+                        { value: '', label: `All Members (${teamMembers.length})` },
+                        ...teamMembers.map((m) => ({ value: m.name, label: m.name })),
+                      ]}
+                    />
+                  ) : (
+                    <div className="inline-flex w-full items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-[11px] font-medium text-slate-500 shadow-sm sm:w-auto sm:py-1.5">
+                      {((mode === 'Tasks' && myTeamTasksLoading) ||
+                        (mode === 'Projects' && myTeamProjectsLoading) ||
+                        (mode === 'SubTasks' && myTeamSubtasksLoading)) ? (
+                        <>
+                          <i className="ri-loader-4-line animate-spin" />
+                          Loading…
+                        </>
+                      ) : (
+                        <>
+                          <i className={
+                            (mode === 'Tasks'
+                              ? myTeamTasksError
+                              : mode === 'SubTasks'
+                                ? myTeamSubtasksError
+                                : myTeamProjectsError)
+                              ? 'ri-error-warning-line text-rose-500'
+                              : 'ri-user-unfollow-line'
+                          } />
+                          {(mode === 'Tasks'
+                            ? myTeamTasksError
+                            : mode === 'SubTasks'
+                              ? myTeamSubtasksError
+                              : myTeamProjectsError)
+                            ? 'Team unavailable'
+                            : 'No members'}
+                        </>
+                      )}
+                    </div>
+                  )
+                ) : null}
+
+                <div className="flex w-full items-center gap-2 sm:w-auto">
+                  <div
+                    className="grid min-w-0 flex-1 grid-cols-3 gap-0.5 rounded-xl border border-slate-200/90 bg-white p-0.5 shadow-sm sm:inline-flex sm:w-auto sm:flex-none sm:rounded-lg"
+                    role="group"
+                    aria-label="View mode"
+                  >
+                    {['Projects', 'Tasks', 'SubTasks'].map((x) => (
+                      <button
+                        key={x}
+                        onClick={() => {
+                          setMode(x);
+                          if (scope === 'My Team') setSelectedMembers([]);
+                        }}
+                        type="button"
+                        className={`min-h-[40px] rounded-lg px-2 text-[11px] font-semibold transition-all sm:min-h-0 sm:rounded-md sm:px-2.5 sm:py-1.5 sm:text-[11px] ${
+                          mode === x
+                            ? 'bg-[#1E62F0] text-white shadow-sm'
+                            : 'bg-transparent text-slate-600 hover:bg-slate-50'
+                        }`}
+                      >
+                        {x === 'SubTasks' ? 'Subtasks' : x}
+                      </button>
+                    ))}
                   </div>
-                )
-              ) : null}
 
-              <div className="inline-flex shrink-0 rounded-lg border border-slate-200/90 bg-white p-0.5 shadow-sm">
-                {['Projects', 'Tasks'].map((x) => (
-                  <button
-                    key={x}
-                    onClick={() => {
-                      setMode(x);
-                      if (scope === 'My Team') setSelectedMembers([]);
-                    }}
-                    type="button"
-                    className={`rounded-md px-2.5 py-1.5 text-[11px] font-semibold transition-all sm:px-3 ${
-                      mode === x
-                        ? 'bg-[#1E62F0] text-white shadow-sm'
-                        : 'bg-transparent text-slate-600 hover:bg-slate-50'
-                    }`}
-                  >
-                    {x}
-                  </button>
-                ))}
-              </div>
-
-              <div className="ml-auto shrink-0 sm:ml-0">
-                <SatelliteOrbitMenu
-                  kfInstance={kfInstance}
-                  placement="inline"
-                  options={PROJECT_TASK_SATELLITE_OPTIONS}
-                  popupIds={USPT_POPUP_IDS}
-                />
+                  <div className="shrink-0">
+                    <SatelliteOrbitMenu
+                      kfInstance={kfInstance}
+                      placement="inline"
+                      fanDirection="down"
+                      options={PROJECT_TASK_SATELLITE_OPTIONS}
+                      popupIds={USPT_POPUP_IDS}
+                    />
+                  </div>
+                </div>
               </div>
             </div>
 
-            {/* Filters — single tray, no stacked labels */}
-            <div className="flex min-w-0 items-center gap-2 rounded-xl border border-slate-200/80 bg-white/95 px-2 py-1.5 shadow-sm">
-              <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+            {/* Filters — Projects / Tasks only (Subtasks hub has its own toolbar) */}
+            {mode !== 'SubTasks' ? (
+            <div className="min-w-0 rounded-xl border border-slate-200/80 bg-white/95 p-2 shadow-sm sm:flex sm:items-center sm:gap-2 sm:px-2 sm:py-1.5">
+              <div className="grid min-w-0 grid-cols-1 gap-2 sm:flex sm:flex-1 sm:items-center sm:gap-1.5 sm:overflow-x-auto sm:[-ms-overflow-style:none] sm:[scrollbar-width:none] sm:[&::-webkit-scrollbar]:hidden">
                 <PtSelect
                   value={companyFilter}
                   onChange={(e) => setCompanyFilter(e.target.value)}
                   leadingIcon="ri-building-2-line"
                   aria-label="Filter by company"
-                  className="min-w-[9.5rem] shrink-0"
-                  triggerClassName="text-xs py-1.5 h-auto min-h-[2rem] rounded-lg bg-slate-50/90 shadow-none"
+                  className="min-w-0 w-full max-w-full sm:min-w-[9.5rem] sm:w-auto sm:shrink-0"
+                  triggerClassName="text-xs py-1.5 h-auto min-h-[2.5rem] sm:min-h-[2rem] rounded-lg bg-slate-50/90 shadow-none"
                   options={[
                     { value: '', label: 'Company' },
                     ...companyOptions.map((opt) => ({ value: opt, label: opt })),
@@ -2625,8 +3205,8 @@ export default function UserSpecificPT({ useLayout = false }) {
                   }}
                   leadingIcon="ri-briefcase-line"
                   aria-label="Filter by business function"
-                  className="min-w-[10rem] shrink-0"
-                  triggerClassName="text-xs py-1.5 h-auto min-h-[2rem] rounded-lg bg-slate-50/90 shadow-none"
+                  className="min-w-0 w-full max-w-full sm:min-w-[10rem] sm:w-auto sm:shrink-0"
+                  triggerClassName="text-xs py-1.5 h-auto min-h-[2.5rem] sm:min-h-[2rem] rounded-lg bg-slate-50/90 shadow-none"
                   options={[
                     { value: '', label: 'Functions' },
                     ...lineOfBusinessOptions.map((opt) => ({ value: opt, label: opt })),
@@ -2638,8 +3218,8 @@ export default function UserSpecificPT({ useLayout = false }) {
                     onChange={(e) => setFunctionTypeFilter(e.target.value)}
                     leadingIcon="ri-stack-line"
                     aria-label="Filter by function type"
-                    className="min-w-[9.5rem] shrink-0"
-                    triggerClassName="text-xs py-1.5 h-auto min-h-[2rem] rounded-lg bg-slate-50/90 shadow-none"
+                    className="min-w-0 w-full max-w-full sm:min-w-[9.5rem] sm:w-auto sm:shrink-0"
+                    triggerClassName="text-xs py-1.5 h-auto min-h-[2.5rem] sm:min-h-[2rem] rounded-lg bg-slate-50/90 shadow-none"
                     options={[
                       { value: '', label: 'Function type' },
                       ...functionTypeOptions.map((opt) => ({ value: opt, label: opt })),
@@ -2647,50 +3227,25 @@ export default function UserSpecificPT({ useLayout = false }) {
                   />
                 ) : null}
 
-                <PtDateRangePicker
-                  from={dateFrom}
-                  to={dateTo}
-                  onFromChange={setDateFrom}
-                  onToChange={setDateTo}
-                  className="min-w-[8.5rem]"
-                  triggerClassName="bg-slate-50/90"
+                <DashboardPeriodPicker
+                  mode={periodPickerState.mode}
+                  range={periodPickerState.range}
+                  ranges={periodPickerState.ranges}
+                  parts={periodPickerState.parts}
+                  fyStartYear={periodPickerState.fyStartYear}
+                  summaryLabel={periodPickerState.summaryLabel}
+                  onChange={handlePeriodChange}
+                  className="min-w-0 w-full max-w-full sm:min-w-[9.5rem] sm:w-auto sm:shrink-0"
+                  triggerClassName="text-xs py-1.5 h-auto min-h-[2.5rem] sm:min-h-[2rem] rounded-lg bg-slate-50/90 shadow-none"
                 />
-
-                <PtSelect
-                  value={createdYear}
-                  onChange={(e) => {
-                    setCreatedYear(e.target.value);
-                    setCreatedPeriod('');
-                  }}
-                  leadingIcon="ri-calendar-2-line"
-                  aria-label="Filter by year"
-                  className="min-w-[8.5rem] shrink-0"
-                  triggerClassName="text-xs py-1.5 h-auto min-h-[2rem] rounded-lg bg-slate-50/90 shadow-none"
-                  options={[
-                    { value: '', label: 'Year' },
-                    ...createdYearOptions,
-                  ]}
-                />
-
-                {createdYear ? (
-                  <PtSelect
-                    value={createdPeriod}
-                    onChange={(e) => setCreatedPeriod(e.target.value)}
-                    leadingIcon="ri-calendar-event-line"
-                    aria-label="Filter by period"
-                    className="min-w-[8.5rem] shrink-0"
-                    triggerClassName="text-xs py-1.5 h-auto min-h-[2rem] rounded-lg bg-slate-50/90 shadow-none"
-                    options={createdPeriodOptions}
-                  />
-                ) : null}
 
                 <PtSelect
                   value={statusFilter}
                   onChange={(e) => setStatusFilter(e.target.value)}
                   leadingIcon="ri-filter-3-line"
                   aria-label="Filter by status"
-                  className="min-w-[8.5rem] shrink-0"
-                  triggerClassName="text-xs py-1.5 h-auto min-h-[2rem] rounded-lg bg-slate-50/90 shadow-none"
+                  className="min-w-0 w-full max-w-full sm:min-w-[8.5rem] sm:w-auto sm:shrink-0"
+                  triggerClassName="text-xs py-1.5 h-auto min-h-[2.5rem] sm:min-h-[2rem] rounded-lg bg-slate-50/90 shadow-none"
                   options={[
                     { value: 'all', label: 'Status' },
                     ...(current.isTasks
@@ -2720,26 +3275,44 @@ export default function UserSpecificPT({ useLayout = false }) {
                 />
               </div>
 
-              {hasActiveDimensionFilters || dateFrom || dateTo || statusFilter !== 'all' ? (
+              {hasActiveDimensionFilters || statusFilter !== 'all' ? (
                 <button
                   type="button"
                   onClick={() => {
                     clearDimensionFilters();
-                    setDateFrom('');
-                    setDateTo('');
                     setStatusFilter('all');
                   }}
-                  className="shrink-0 rounded-lg px-2 py-1.5 text-[11px] font-semibold text-[#1E88E5] transition hover:bg-blue-50"
+                  className="mt-2 w-full rounded-lg px-2 py-2 text-[11px] font-semibold text-[#1E88E5] transition hover:bg-blue-50 sm:mt-0 sm:w-auto sm:shrink-0 sm:py-1.5"
                 >
                   Clear
                 </button>
               ) : null}
             </div>
+            ) : null}
           </div>
         </div>
 
         <div className="mx-auto max-w-[1800px] min-w-0 space-y-4">
 
+        {mode === 'SubTasks' ? (
+          <>
+            {scope === 'My Team' && myTeamSubtasksError ? (
+              <div className="rounded-2xl border border-rose-200 bg-rose-50/70 p-3 text-xs font-semibold text-rose-700">
+                Failed to load My Team subtasks: {myTeamSubtasksError}
+              </div>
+            ) : null}
+            <UserHubSubTasksPage
+              embedded
+              myTeamMode={scope === 'My Team'}
+              myTeamRows={scope === 'My Team' ? myTeamSubtasks : null}
+              myTeamLoading={scope === 'My Team' ? myTeamSubtasksLoading : false}
+              selectedMembers={scope === 'My Team' ? selectedMembers : []}
+              onOpenRow={scope === 'My Team' ? handleOpenMyTeamSubtaskDetail : undefined}
+              processPopupId={scope === 'My Work' ? USPT_POPUP_IDS.subtask : undefined}
+            />
+          </>
+        ) : (
+        <>
         {apiError ? (
           <div className="rounded-2xl border border-rose-200 bg-rose-50/70 p-3 text-xs font-semibold text-rose-700">
             Failed to load data: {apiError}
@@ -2755,34 +3328,6 @@ export default function UserSpecificPT({ useLayout = false }) {
         {scope === 'My Team' && mode === 'Tasks' && myTeamTasksError ? (
           <div className="rounded-2xl border border-rose-200 bg-rose-50/70 p-3 text-xs font-semibold text-rose-700">
             Failed to load My Team tasks: {myTeamTasksError}
-          </div>
-        ) : null}
-
-        {isMyWorkTasksHub ? (
-          <div className="rounded-2xl border border-slate-200/80 bg-white/95 p-3 shadow-sm sm:p-4">
-            <UserHubTaskToolbar
-              taskScope={taskOwnershipScope}
-              onTaskScopeChange={handleTaskOwnershipScopeChange}
-              createdTotal={hubTaskCounts.created}
-              assignedTotal={hubTaskCounts.assignedOpen + hubTaskCounts.assignedClosed}
-              createdStatusFilter={createdStatusFilter}
-              onCreatedStatusChange={handleCreatedStatusChange}
-              statusCounts={hubStatusCounts}
-              assignedStatus={assignedStatus}
-              onAssignedStatusChange={handleAssignedStatusChange}
-              assignedOpenCount={hubTaskCounts.assignedOpen}
-              assignedClosedCount={hubTaskCounts.assignedClosed}
-              showDeleteDrafts={false}
-              selectedDraftCount={0}
-              deletingDrafts={false}
-              onDeleteDrafts={() => {}}
-            />
-            {current.hubLoading ? (
-              <p className="mt-2 text-[11px] font-medium text-slate-500">
-                <i className="ri-loader-4-line mr-1 inline-block animate-spin" />
-                Loading {taskOwnershipScope === 'created' ? 'created' : 'assigned'} tasks…
-              </p>
-            ) : null}
           </div>
         ) : null}
 
@@ -2804,6 +3349,7 @@ export default function UserSpecificPT({ useLayout = false }) {
         </div>
 
         <div className="grid grid-cols-1 gap-3">
+          {/* Focus Areas — temporarily disabled
           <div className="rounded-2xl border border-slate-200/80 bg-white/95 p-3 shadow-lg shadow-slate-200/40 backdrop-blur-sm sm:p-4">
             <h3 className="mb-3 text-sm font-bold text-slate-900">Focus Areas</h3>
             <div className="grid gap-2 sm:grid-cols-2 md:grid-cols-3" key={`focus-${filterKey}`}>
@@ -2891,6 +3437,8 @@ export default function UserSpecificPT({ useLayout = false }) {
             </div>
           </div>
 
+          */}
+
           {/* Workload Summary — hidden so Focus Areas + table use full width
           <div className="min-w-0 rounded-2xl border border-slate-200/80 bg-white/95 p-3 shadow-lg shadow-slate-200/40 backdrop-blur-sm sm:p-4">
             <div className="mb-3 flex items-center justify-between gap-2">
@@ -2968,6 +3516,34 @@ export default function UserSpecificPT({ useLayout = false }) {
           */}
         </div>
 
+        {isMyWorkTasksHub ? (
+          <div className="rounded-2xl border border-slate-200/80 bg-white/95 p-3 shadow-sm sm:p-4">
+            <UserHubTaskToolbar
+              taskScope={taskOwnershipScope}
+              onTaskScopeChange={handleTaskOwnershipScopeChange}
+              createdTotal={hubTaskCounts.created}
+              assignedTotal={hubTaskCounts.assignedOpen + hubTaskCounts.assignedClosed}
+              createdStatusFilter={createdStatusFilter}
+              onCreatedStatusChange={handleCreatedStatusChange}
+              statusCounts={hubStatusCounts}
+              assignedStatus={assignedStatus}
+              onAssignedStatusChange={handleAssignedStatusChange}
+              assignedOpenCount={hubTaskCounts.assignedOpen}
+              assignedClosedCount={hubTaskCounts.assignedClosed}
+              showDeleteDrafts={showDraftBulkSelect}
+              selectedDraftCount={selectedDraftIds.size}
+              deletingDrafts={deletingDrafts}
+              onDeleteDrafts={handleDeleteDrafts}
+            />
+            {current.hubLoading ? (
+              <p className="mt-2 text-[11px] font-medium text-slate-500">
+                <i className="ri-loader-4-line mr-1 inline-block animate-spin" />
+                Loading {taskOwnershipScope === 'created' ? 'created' : 'assigned'} tasks…
+              </p>
+            ) : null}
+          </div>
+        ) : null}
+
         <div className="grid grid-cols-1 gap-3">
           <div
             ref={tableSectionRef}
@@ -2978,18 +3554,31 @@ export default function UserSpecificPT({ useLayout = false }) {
             }`}
           >
             <div className="flex flex-col gap-2 border-b border-slate-200/80 px-3 py-3 sm:px-4 lg:flex-row lg:flex-wrap lg:items-center lg:justify-between">
-              <div className="min-w-0">
-                <h3 className="text-sm font-bold text-slate-900">
-                  {isMyWorkTasksHub
-                    ? (taskOwnershipScope === 'created' ? 'Tasks Created by Me' : 'Tasks Assigned to me')
-                    : `${scope === 'My Work' ? 'My' : 'Team'} ${mode}`}
-                </h3>
-                <p className="text-xs text-slate-500">
-                  {tableTotal} {mode.toLowerCase()} found
-                  {tableTotalPages > 1 ? ` · ${PT_TABLE_PAGE_SIZE} per page` : ''}
-                  {!current.isTasks ? ' · chevron expands tasks · name opens details' : ''}
-                  {current.isTasks ? ' · chevron expands subtasks' : ''}
-                </p>
+              <div className="flex min-w-0 flex-wrap items-center gap-2 sm:gap-3">
+                <div className="min-w-0">
+                  <h3 className="text-sm font-bold text-slate-900">
+                    {isMyWorkTasksHub
+                      ? (taskOwnershipScope === 'created' ? 'Tasks Created by Me' : 'Tasks Assigned to me')
+                      : `${scope === 'My Work' ? 'My' : 'Team'} ${mode}`}
+                  </h3>
+                  <p className="text-xs text-slate-500">
+                    {tableTotal} {mode.toLowerCase()} found
+                    {tableTotalPages > 1 ? ` · ${PT_TABLE_PAGE_SIZE} per page` : ''}
+                    {!current.isTasks ? ' · chevron expands tasks · name opens details' : ''}
+                    {current.isTasks ? ' · chevron expands subtasks' : ''}
+                  </p>
+                </div>
+                {showDraftBulkSelect && selectedDraftIds.size > 0 ? (
+                  <button
+                    type="button"
+                    onClick={handleDeleteDrafts}
+                    disabled={deletingDrafts}
+                    className="inline-flex min-h-[36px] shrink-0 items-center justify-center gap-1.5 rounded-xl border border-rose-200 bg-rose-50 px-3 py-1.5 text-xs font-semibold text-rose-700 transition hover:bg-rose-100 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    <i className="ri-delete-bin-6-line text-sm" aria-hidden />
+                    {deletingDrafts ? 'Deleting…' : `Delete (${selectedDraftIds.size})`}
+                  </button>
+                ) : null}
               </div>
               <div className="flex w-full min-w-0 flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center lg:w-auto lg:justify-end">
                 <div className="relative min-w-0 w-full sm:max-w-xs sm:flex-1 lg:w-56 lg:flex-none">
@@ -3024,6 +3613,17 @@ export default function UserSpecificPT({ useLayout = false }) {
               >
                 <thead>
                   <tr className="border-b border-slate-200/90 bg-slate-50/80">
+                    {showDraftBulkSelect ? (
+                      <th className="w-10 px-3 py-3 sm:px-4">
+                        <input
+                          type="checkbox"
+                          aria-label="Select all draft tasks on this page"
+                          checked={allDraftPageSelected}
+                          onChange={(e) => handleToggleAllDraftsSelect(e.target.checked, draftPageRowIds)}
+                          className="h-4 w-4 rounded border-slate-300 text-[#1E62F0] focus:ring-[#1E62F0]"
+                        />
+                      </th>
+                    ) : null}
                     {mainTableColumns.map((col) => {
                       const filterCfg = col.filter ? mainColumnFilterProps[col.filter] : null;
                       return (
@@ -3047,7 +3647,7 @@ export default function UserSpecificPT({ useLayout = false }) {
                   {pageRows.length === 0 ? (
                     <tr>
                       <td
-                        colSpan={current.isTasks ? 8 : 6}
+                        colSpan={mainTableColSpan}
                         className="px-5 py-12 text-center text-sm text-slate-500"
                       >
                         No {mode.toLowerCase()} found
@@ -3056,7 +3656,7 @@ export default function UserSpecificPT({ useLayout = false }) {
                   ) : null}
                   {pageRows.map((row) => {
                     const projectExpanded = !current.isTasks && expandedProjectId === row.id;
-                    const projectColSpan = 6;
+                    const projectColSpan = mainTableColSpan;
                     const projectAccordionTasks = isMyWork ? apiTasks : myTeamTasks;
                     const childSubtasks = current.isTasks
                       ? filterSubtasksForTask(apiProcessSubtasks, resolveTaskBusinessIdFromRow(row))
@@ -3069,6 +3669,7 @@ export default function UserSpecificPT({ useLayout = false }) {
                     // Completed tasks keep expand when they already have subtasks; create stays blocked.
                     const showTaskNested = current.isTasks && (hasExistingSubtasks || canAddSubtask);
                     const taskExpanded = current.isTasks && expandedTaskIds.has(row.id);
+                    const draftSelectId = showDraftBulkSelect ? resolveTaskDraftDeleteId(row) : '';
 
                     return (
                     <Fragment key={row.id}>
@@ -3087,17 +3688,31 @@ export default function UserSpecificPT({ useLayout = false }) {
                         current.isTasks ? 'cursor-pointer' : ''
                       } ${projectExpanded || taskExpanded ? 'bg-slate-50/70' : ''}`}
                     >
+                      {showDraftBulkSelect ? (
+                        <td
+                          className="px-3 py-3 sm:px-4"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <input
+                            type="checkbox"
+                            aria-label={`Select draft ${row.name || ''}`}
+                            checked={draftSelectId ? selectedDraftIds.has(draftSelectId) : false}
+                            onChange={() => handleToggleDraftSelect(draftSelectId)}
+                            className="h-4 w-4 rounded border-slate-300 text-[#1E62F0] focus:ring-[#1E62F0]"
+                          />
+                        </td>
+                      ) : null}
                       {current.isTasks ? (
                         <>
                           <td className="px-5 py-3">
-                            <div className="flex items-start gap-2">
+                            <div className="flex items-center gap-2">
                               <TaskExpandToggle
                                 visible={showTaskNested}
                                 expanded={taskExpanded}
                                 onToggle={(e) => toggleTaskExpand(row.id, e)}
                               />
                               <div className="min-w-0">
-                            <p className="text-[11px] font-semibold text-slate-800">{row.name}</p>
+                              <p className="text-[11px] font-normal leading-none text-slate-800">{row.name}</p>
                                 {hasExistingSubtasks ? (
                                   <p className="text-[10px] font-medium text-[#FB8C00]">
                                     {childSubtasks.length} subtask{childSubtasks.length === 1 ? '' : 's'}
@@ -3110,12 +3725,7 @@ export default function UserSpecificPT({ useLayout = false }) {
                             <UsptProjectCell projectName={row.project} />
                           </td>
                           <td className="px-5 py-3">
-                            <div className="flex items-center gap-2">
-                              <span className="flex h-7 w-7 items-center justify-center rounded-full bg-blue-100 text-[11px] font-bold text-blue-700">
-                                {row.initials}
-                              </span>
-                              <span className="max-w-[140px] truncate text-[11px] text-slate-700">{row.assignee}</span>
-                            </div>
+                            <PtUserAvatar name={row.assignee} initials={row.initials} />
                           </td>
                           <td className="whitespace-nowrap px-5 py-3 text-[11px] text-slate-700">{row.start}</td>
                           <td className="whitespace-nowrap px-5 py-3 text-[11px] text-slate-700">{row.end}</td>
@@ -3181,13 +3791,18 @@ export default function UserSpecificPT({ useLayout = false }) {
                                   if (isMyWork) openMyWorkProjectPopup(row);
                                   else handleOpenProjectDetail(row);
                                 }}
-                                className="text-left text-[11px] font-semibold text-slate-800 transition hover:text-[#1E62F0] hover:underline"
+                                className="text-left text-[11px] font-normal text-slate-800 transition hover:text-[#1E62F0] hover:underline"
                               >
                                 {row.name}
                               </button>
                             </div>
                           </td>
-                          <td className="max-w-[140px] truncate whitespace-nowrap px-5 py-3 text-[11px] text-slate-700">{row.owner}</td>
+                          <td className="px-5 py-3">
+                            <PtUserAvatar
+                              name={row.owner}
+                              initials={row.ownerAvatar || toInitials(row.owner)}
+                            />
+                          </td>
                           <td className="whitespace-nowrap px-5 py-3 text-[11px] font-bold text-blue-700">{row.progress}%</td>
                           <td className="px-5 py-3">
                             <span
@@ -3199,6 +3814,16 @@ export default function UserSpecificPT({ useLayout = false }) {
                             </span>
                           </td>
                           <td className="whitespace-nowrap px-5 py-3 text-[11px] text-slate-700">{row.end}</td>
+                          <td className="px-5 py-3">
+                            {row.revisedCount > 0 ? (
+                              <span className="inline-flex items-center gap-1 rounded-full bg-orange-50 px-2 py-0.5 text-[10px] font-semibold text-[#FB8C00]">
+                                <i className="ri-refresh-line text-[10px]" />
+                                {row.revisedCount}x
+                              </span>
+                            ) : (
+                              <span className="text-[10px] text-slate-400">—</span>
+                            )}
+                          </td>
                           <td className="px-5 py-3">
                             <span
                               className={`inline-flex whitespace-nowrap rounded-full px-2 py-0.5 text-[10px] font-semibold ${
@@ -3234,7 +3859,7 @@ export default function UserSpecificPT({ useLayout = false }) {
                     ) : null}
                     {showTaskNested && taskExpanded ? (
                       <tr className="bg-slate-50/95">
-                        <td colSpan={8} className="px-5 py-4 align-top">
+                        <td colSpan={mainTableColSpan} className="px-5 py-4 align-top">
                           <UsptTaskSubtasksPanel
                             task={row}
                             processSubtasks={apiProcessSubtasks}
@@ -3269,13 +3894,23 @@ export default function UserSpecificPT({ useLayout = false }) {
                     typeof handleCreateSubtaskForTask === 'function' && !isTaskCompleted(row.status);
                   const showTaskNested = hasExistingSubtasks || canAddSubtask;
                   const taskExpanded = expandedTaskIds.has(row.id);
+                  const draftSelectId = showDraftBulkSelect ? resolveTaskDraftDeleteId(row) : '';
 
                   return (
                     <div
                       key={row.id}
                       className={`overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm ring-1 ring-slate-100 ${taskExpanded ? 'ring-[#1E88E5]/30' : ''}`}
                     >
-                      <div className="flex items-start gap-2 p-3">
+                      <div className="flex items-center gap-2 p-3">
+                        {showDraftBulkSelect ? (
+                          <input
+                            type="checkbox"
+                            aria-label={`Select draft ${row.name || ''}`}
+                            checked={draftSelectId ? selectedDraftIds.has(draftSelectId) : false}
+                            onChange={() => handleToggleDraftSelect(draftSelectId)}
+                            className="h-4 w-4 shrink-0 rounded border-slate-300 text-[#1E62F0] focus:ring-[#1E62F0]"
+                          />
+                        ) : null}
                         <TaskExpandToggle
                           visible={showTaskNested}
                           expanded={taskExpanded}
@@ -3290,14 +3925,14 @@ export default function UserSpecificPT({ useLayout = false }) {
                         >
                           <div className="flex items-start justify-between gap-2">
                             <div className="min-w-0">
-                              <p className="truncate text-sm font-semibold text-slate-900">{row.name}</p>
+                              <p className="truncate text-sm font-normal text-slate-900">{row.name}</p>
                               <p className="mt-0.5">
                                 {isEmptyProjectName(row.project) ? (
-                                  <span className="inline-flex items-center rounded-full bg-violet-50 px-1.5 py-0.5 text-[10px] font-semibold text-violet-700 ring-1 ring-violet-200/80">
+                                  <span className="inline-flex items-center rounded-full bg-violet-50 px-1.5 py-0.5 text-[10px] font-normal text-violet-700 ring-1 ring-violet-200/80">
                                     Individual Task
                                   </span>
                                 ) : (
-                                  <span className="truncate text-[10px] text-[#1E88E5]">{row.project}</span>
+                                  <span className="truncate text-[10px] font-normal text-[#1E88E5]">{row.project}</span>
                                 )}
                               </p>
                               {hasExistingSubtasks ? (
@@ -3311,7 +3946,7 @@ export default function UserSpecificPT({ useLayout = false }) {
                             </span>
                           </div>
                           <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-600">
-                            <span className="truncate">{row.assignee || '—'}</span>
+                            <PtUserAvatar name={row.assignee} initials={row.initials} sizeClass="h-6 w-6" textClass="text-[9px]" />
                             <span className="shrink-0">{row.end || '—'}</span>
                           </div>
                           <div className="mt-2 flex flex-wrap gap-1.5">
@@ -3322,6 +3957,12 @@ export default function UserSpecificPT({ useLayout = false }) {
                             >
                               {row.delay}
                             </span>
+                            {row.revisedCount > 0 ? (
+                              <span className="inline-flex items-center gap-1 rounded-full bg-orange-50 px-2 py-0.5 text-[10px] font-semibold text-[#FB8C00]">
+                                <i className="ri-refresh-line text-[10px]" />
+                                {row.revisedCount}x
+                              </span>
+                            ) : null}
                             <span
                               className={`inline-flex rounded-full px-2 py-0.5 text-[10px] font-semibold ${
                                 row.priority === 'High'
@@ -3358,8 +3999,8 @@ export default function UserSpecificPT({ useLayout = false }) {
                     className={`overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm ring-1 ring-slate-100 ${projectExpanded ? 'ring-[#1E88E5]/30' : ''}`}
                   >
                     <div className="flex items-start gap-2 p-3">
-                      <button
-                        type="button"
+              <button
+                type="button"
                         onClick={() => toggleProjectExpand(row)}
                         className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-slate-400 transition hover:bg-slate-100 hover:text-slate-700"
                         aria-label={projectExpanded ? 'Collapse project tasks' : 'Expand project tasks'}
@@ -3375,8 +4016,15 @@ export default function UserSpecificPT({ useLayout = false }) {
                         }}
                         className="min-w-0 flex-1 text-left"
                       >
-                        <p className="truncate text-sm font-semibold text-slate-900 hover:text-[#1E62F0] hover:underline">{row.name}</p>
-                        <p className="mt-0.5 text-[10px] text-slate-500">{row.owner || '—'}</p>
+                        <p className="truncate text-sm font-normal text-slate-900 hover:text-[#1E62F0] hover:underline">{row.name}</p>
+                        <div className="mt-0.5">
+                          <PtUserAvatar
+                            name={row.owner}
+                            initials={row.ownerAvatar || toInitials(row.owner)}
+                            sizeClass="h-6 w-6"
+                            textClass="text-[9px]"
+                          />
+                        </div>
                       </button>
                       <span
                         className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold ${
@@ -3404,6 +4052,14 @@ export default function UserSpecificPT({ useLayout = false }) {
                       >
                         {row.delay}
                       </span>
+                      {row.revisedCount > 0 ? (
+                        <span className="inline-flex w-fit items-center justify-self-end gap-1 rounded-full bg-orange-50 px-2 py-0.5 text-[10px] font-semibold text-[#FB8C00]">
+                          <i className="ri-refresh-line text-[10px]" />
+                          {row.revisedCount}x revised
+                        </span>
+                      ) : (
+                        <span className="justify-self-end text-[10px] text-slate-400">Revised —</span>
+                      )}
                     </button>
                     {projectExpanded ? (
                       <div className="border-t border-slate-100 bg-slate-50/90">
@@ -3489,6 +4145,9 @@ export default function UserSpecificPT({ useLayout = false }) {
           ) : null}
           */}
         </div>
+
+        </>
+        )}
 
         {/* Quick Filters removed per request */}
       </div>

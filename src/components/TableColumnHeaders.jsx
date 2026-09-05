@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect, useLayoutEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
-import { attachMenuWheelGuard, isScrollEventInsideEl } from '../lib/portalMenuGuards.js';
+import { attachMenuWheelGuard, isScrollEventInsideEl, PORTAL_MENU_Z_INDEX } from '../lib/portalMenuGuards.js';
 
 /**
  * Shared table column headers for Project Tracker.
@@ -89,7 +89,7 @@ export function FilterHeader({
       left,
       width,
       maxHeight: Math.max(160, maxH),
-      zIndex: 9999,
+      zIndex: PORTAL_MENU_Z_INDEX,
       ...(preferUp ? { bottom, top: undefined } : { top, bottom: undefined }),
     });
     return true;

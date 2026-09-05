@@ -1,9 +1,13 @@
 /**
  * User Hub — tasks page only.
- * Data model mirrors mis-table-kf:
- * - Tasks Created by Me  = My Items   (myitems/{status})
- * - Tasks Assigned to me = My Tasks   (pending) + Participated (closed)
- * Light load: count APIs + one page of the active view (no per-row enrich).
+ * Data model mirrors mis-table-kf (same Kissflow endpoints, renamed labels):
+ * - Tasks Created by Me  = My Items      → myitems/status/count + myitems/{draft|inprogress|…}
+ * - Tasks Assigned to me = My Tasks      → pending/activity/count + pending/{activityId} (Open)
+ *                          + Participated → participated/activity/count + list (Closed)
+ * Light load: status/activity counts + one page of the active view (no per-row enrich).
+ * Heavy project/task report APIs are skipped via ProjectDashboardPage lightHubTasksMode.
+ *
+ * After Kissflow popup Save/Submit, `context.watchParams` bumps refreshTick so lists + counts reload.
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import ProjectDashboardPage from './ProjectDashboardPage.jsx';
@@ -19,7 +23,11 @@ import {
   unwrapTaskPageResult,
   HUB_TASK_PAGE_SIZE,
 } from './lib/kfPmTaskProcessItems.js';
-import { openUserHubTaskCreatePopup, openUserHubTaskPopup } from './lib/kfUserHubPopups.js';
+import {
+  openUserHubSubtaskPopup,
+  openUserHubTaskCreatePopup,
+  openUserHubTaskPopup,
+} from './lib/kfUserHubPopups.js';
 
 const EMPTY_STATUS_COUNTS = {
   Draft: 0,
@@ -43,6 +51,8 @@ export default function UserHubTasksPage({ useLayout = false }) {
 
   const [selectedDraftIds, setSelectedDraftIds] = useState(() => new Set());
   const [deletingDrafts, setDeletingDrafts] = useState(false);
+  /** Bumped when Kissflow popup closes / page params change — refreshes table + counts. */
+  const [refreshTick, setRefreshTick] = useState(0);
 
   const loadStatusCounts = useCallback(async () => {
     if (!kfInstance?.api) return null;
@@ -97,7 +107,24 @@ export default function UserHubTasksPage({ useLayout = false }) {
 
   useEffect(() => {
     loadProcessTasks();
-  }, [loadProcessTasks]);
+  }, [loadProcessTasks, refreshTick]);
+
+  /** Kissflow fires watchParams when a popup action closes and updates page context. */
+  useEffect(() => {
+    if (!kfInstance?.context?.watchParams) return undefined;
+    let timer = null;
+    const unsub = kfInstance.context.watchParams(() => {
+      // Short delay so submit has time to commit before we re-fetch.
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        setRefreshTick((n) => n + 1);
+      }, 300);
+    });
+    return () => {
+      if (timer) clearTimeout(timer);
+      if (typeof unsub === 'function') unsub();
+    };
+  }, [kfInstance]);
 
   useEffect(() => {
     setSelectedDraftIds(new Set());
@@ -206,19 +233,31 @@ export default function UserHubTasksPage({ useLayout = false }) {
     ],
   );
 
+  const scheduleRefreshAfterPopup = useCallback(() => {
+    // Fallback when openPopup promise does settle (watchParams is primary).
+    setTimeout(() => setRefreshTick((n) => n + 1), 300);
+  }, []);
+
   const handleOpenTaskRow = useCallback(
-    (row) => openUserHubTaskPopup(kfInstance, row),
-    [kfInstance],
+    (row) => openUserHubTaskPopup(kfInstance, row, { onClosed: scheduleRefreshAfterPopup }),
+    [kfInstance, scheduleRefreshAfterPopup],
   );
 
-  const handleCreateTask = useCallback(
-    () => openUserHubTaskCreatePopup(kfInstance),
-    [kfInstance],
+  /** Nested subtask create/open — Popup_WbcLURdUXx (UserHubTasks only). */
+  const handleOpenSubtaskRow = useCallback(
+    (row) => {
+      openUserHubSubtaskPopup(kfInstance, row, { onClosed: scheduleRefreshAfterPopup });
+    },
+    [kfInstance, scheduleRefreshAfterPopup],
   );
+
+  const handleCreateTask = useCallback(() => {
+    openUserHubTaskCreatePopup(kfInstance, { onClosed: scheduleRefreshAfterPopup });
+  }, [kfInstance, scheduleRefreshAfterPopup]);
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-[#edf1ff] via-[#f6f8ff] to-[#f2ecff]">
-      <div className="mx-auto max-w-[1800px] p-2 pb-6 sm:p-6">
+    <div className="min-h-screen overflow-x-clip bg-gradient-to-b from-[#edf1ff] via-[#f6f8ff] to-[#f2ecff]">
+      <div className="mx-auto min-w-0 max-w-[1800px] p-3 pb-6 sm:p-6">
         <ProjectDashboardPage
           useLayout={useLayout}
           scopeToCurrentUser
@@ -231,6 +270,9 @@ export default function UserHubTasksPage({ useLayout = false }) {
           hideUserScopeToggle
           hideWelcomeHeader
           embeddedInHub
+          // Company / Business Functions filters are parked for now.
+          // Comment out the line below to bring them back.
+          hideCompanyFunctionFilters
           hubWelcome={{
             greeting,
             firstName,
@@ -241,6 +283,7 @@ export default function UserHubTasksPage({ useLayout = false }) {
           onCreateTaskRecord={handleCreateTask}
           taskTableToolbar={taskTableToolbar}
           onOpenTaskRow={handleOpenTaskRow}
+          onOpenSubtaskRow={handleOpenSubtaskRow}
           taskBulkSelectEnabled={showDraftBulkSelect}
           taskSelectedRowIds={selectedDraftIds}
           onTaskToggleRowSelect={handleToggleRowSelect}

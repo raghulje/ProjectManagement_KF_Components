@@ -4,6 +4,16 @@ import { createPortal } from 'react-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import AppLayout from './components/feature/AppLayout.jsx';
 import PtSelect from './components/PtSelect.jsx';
+import DashboardPeriodPicker, {
+  getEmptyPeriodState,
+} from './components/DashboardPeriodPicker.jsx';
+import MobileFilterSheet, {
+  MobileFiltersButton,
+  MobileActiveFilterChips,
+  MobileFilterField,
+  useIsDesktopLg,
+} from './components/MobileFilterSheet.jsx';
+import PtUserAvatar from './components/PtUserAvatar.jsx';
 import UserHubWelcome from './components/UserHubWelcome.jsx';
 import TablePaginationBar, { PT_TABLE_PAGE_SIZE } from './components/TablePaginationBar.jsx';
 import SubtaskAccordionRow from './components/SubtaskAccordionRow.jsx';
@@ -25,7 +35,11 @@ import {
   filterSubtasksForTask,
 } from './lib/kfProjectTrackerKarthika.js';
 import { kfGetJson, resolveKissflowAccountId } from './lib/kfRuntime.js';
-import { fetchTaskTrackerData } from './lib/kfTaskTracker.js';
+import {
+  ensureTaskBusinessIdForCreate,
+  fetchTaskTrackerData,
+  resolveTaskBusinessIdFromRow,
+} from './lib/kfTaskTracker.js';
 import { fetchMyTeamProjects } from './lib/kfMyTeamProjects.js';
 import {
   fetchMyTeamTasks,
@@ -792,12 +806,66 @@ function projectMatchesCreatedRange(row, range) {
   return t >= range.from.getTime() && t <= range.to.getTime();
 }
 
-function hasActiveDimensionFilters(filters) {
+function parseYmdRange(fromStr, toStr) {
+  const fromRaw = String(fromStr || '').trim();
+  const toRaw = String(toStr || '').trim();
+  if (!fromRaw || !toRaw) return null;
+  const from = new Date(`${fromRaw}T00:00:00`);
+  const to = new Date(`${toRaw}T23:59:59.999`);
+  if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) return null;
+  return { from, to };
+}
+
+/** Prefer adaptive Period picker windows (OR multi-select); fall back to legacy year/period. */
+function resolveDimensionCreatedRanges(filters) {
+  const multi = Array.isArray(filters?.periodRanges) ? filters.periodRanges : [];
+  if (multi.length) {
+    return multi.map((r) => parseYmdRange(r?.from, r?.to)).filter(Boolean);
+  }
+  const single = parseYmdRange(filters?.periodFrom, filters?.periodTo);
+  if (single) return [single];
+  const legacy = resolveCreatedDateRange(filters?.createdYear, filters?.createdPeriod);
+  return legacy ? [legacy] : [];
+}
+
+function projectMatchesAnyCreatedRange(row, ranges) {
+  if (!Array.isArray(ranges) || ranges.length === 0) return true;
+  return ranges.some((range) => projectMatchesCreatedRange(row, range));
+}
+
+function taskMatchesCreatedRange(row, range) {
+  if (!range) return true;
+  const created = parseKfDate(
+    row?.createdAt ||
+      row?.createdDate ||
+      row?._created_at ||
+      row?.raw?._created_at ||
+      row?.raw?.Created_at,
+  );
+  if (!created) return false;
+  const t = created.getTime();
+  return t >= range.from.getTime() && t <= range.to.getTime();
+}
+
+function taskMatchesAnyCreatedRange(row, ranges) {
+  if (!Array.isArray(ranges) || ranges.length === 0) return true;
+  return ranges.some((range) => taskMatchesCreatedRange(row, range));
+}
+
+function hasPortfolioDimensionFilters(filters) {
   return Boolean(
     filters?.company ||
       filters?.department ||
       filters?.lineOfBusiness ||
-      filters?.functionType ||
+      filters?.functionType,
+  );
+}
+
+function hasActiveDimensionFilters(filters) {
+  return Boolean(
+    hasPortfolioDimensionFilters(filters) ||
+      filters?.periodFrom ||
+      (Array.isArray(filters?.periodRanges) && filters.periodRanges.length > 0) ||
       filters?.createdYear,
   );
 }
@@ -810,32 +878,44 @@ function isInformationTechnologyCategory(value) {
 
 function filterProjectsByDimensions(rows, filters) {
   if (!hasActiveDimensionFilters(filters)) return rows;
-  const createdRange = resolveCreatedDateRange(filters.createdYear, filters.createdPeriod);
+  const createdRanges = resolveDimensionCreatedRanges(filters);
   return rows.filter((row) => {
     if (filters.company && normalizeDimensionValue(row.companyName) !== filters.company) return false;
     if (filters.department && normalizeDimensionValue(row.department) !== filters.department) return false;
     if (filters.lineOfBusiness && normalizeDimensionValue(row.lineOfBusiness) !== filters.lineOfBusiness) return false;
     if (filters.functionType && normalizeDimensionValue(row.functionType) !== filters.functionType) return false;
-    if (!projectMatchesCreatedRange(row, createdRange)) return false;
+    if (!projectMatchesAnyCreatedRange(row, createdRanges)) return false;
     return true;
   });
 }
 
 function filterTasksByProjects(tasks, projects, filters) {
   if (!hasActiveDimensionFilters(filters)) return tasks;
-  if (!projects.length) return [];
 
-  const projectIds = new Set(projects.map((p) => p.id));
-  const projectNames = new Set(projects.map((p) => p.name).filter(Boolean));
-  const projectRefs = new Set(projects.map((p) => String(p.displayId || '').trim()).filter(Boolean));
+  const createdRanges = resolveDimensionCreatedRanges(filters);
+  const needsProjectLink = hasPortfolioDimensionFilters(filters);
+  let next = Array.isArray(tasks) ? tasks : [];
 
-  return tasks.filter((task) => {
-    if (task.projectId && projectIds.has(task.projectId)) return true;
-    if (task.projectName && projectNames.has(task.projectName)) return true;
-    const ref = String(task.projectRef || task.raw?.Project_ID_Details || '').trim();
-    if (ref && projectRefs.has(ref)) return true;
-    return false;
-  });
+  if (needsProjectLink) {
+    if (!projects.length) return [];
+    const projectIds = new Set(projects.map((p) => p.id));
+    const projectNames = new Set(projects.map((p) => p.name).filter(Boolean));
+    const projectRefs = new Set(projects.map((p) => String(p.displayId || '').trim()).filter(Boolean));
+
+    next = next.filter((task) => {
+      if (task.projectId && projectIds.has(task.projectId)) return true;
+      if (task.projectName && projectNames.has(task.projectName)) return true;
+      const ref = String(task.projectRef || task.raw?.Project_ID_Details || '').trim();
+      if (ref && projectRefs.has(ref)) return true;
+      return false;
+    });
+  }
+
+  if (createdRanges.length) {
+    next = next.filter((task) => taskMatchesAnyCreatedRange(task, createdRanges));
+  }
+
+  return next;
 }
 
 function filterProcessSubtasksByTasks(processSubtasks, tasks, filters) {
@@ -857,22 +937,164 @@ function filterProcessSubtasksByTasks(processSubtasks, tasks, filters) {
   });
 }
 
-function DashboardDimensionFilters({ filters, options, onChange, onClear, hasActiveFilters, prefix = null, suffix = null }) {
+function countActiveDimensionFilters(filters) {
+  let n = 0;
+  if (filters?.company) n += 1;
+  if (filters?.department) n += 1;
+  if (filters?.lineOfBusiness) n += 1;
+  if (filters?.functionType) n += 1;
+  if (filters?.periodFrom || (Array.isArray(filters?.periodRanges) && filters.periodRanges.length > 0)) n += 1;
+  if (filters?.createdYear) n += 1;
+  return n;
+}
+
+function DashboardDimensionFilters({
+  filters,
+  options,
+  onChange,
+  onClear,
+  hasActiveFilters,
+  prefix = null,
+  suffix = null,
+  portfolioUserFilter = '',
+  onPortfolioUserChange = null,
+  portfolioUserOptions = null,
+  /** Hides Company / Business Functions / Function Type (UserHub tasks). */
+  hideCompanyFunctionFilters = false,
+}) {
+  const [sheetOpen, setSheetOpen] = useState(false);
+  const [draft, setDraft] = useState(filters);
   const showFunctionType = isInformationTechnologyCategory(filters.lineOfBusiness);
-  const createdPeriodOptions = getCreatedPeriodOptions(filters.createdYear);
+  const draftShowFunctionType = isInformationTechnologyCategory(draft?.lineOfBusiness);
+  const periodState = {
+    mode: filters.periodMode || 'all',
+    range: { from: filters.periodFrom || '', to: filters.periodTo || '' },
+    ranges: Array.isArray(filters.periodRanges) ? filters.periodRanges : [],
+    parts: Array.isArray(filters.periodParts) ? filters.periodParts : [],
+    fyStartYear: filters.periodFyStartYear ?? null,
+    summaryLabel: filters.periodLabel || 'All time',
+  };
+  const baseFields = hideCompanyFunctionFilters
+    ? []
+    : [
+        { key: 'company', label: 'Company', icon: 'ri-building-2-line', allLabel: 'All companies' },
+        { key: 'lineOfBusiness', label: 'Business Functions', icon: 'ri-briefcase-line', allLabel: 'All Functions' },
+      ];
+  const functionTypeField = {
+    key: 'functionType',
+    label: 'Function Type',
+    icon: 'ri-stack-line',
+    allLabel: 'All Function Types',
+  };
   const fields = [
-    { key: 'company', label: 'Company', icon: 'ri-building-2-line', allLabel: 'All companies' },
-    // Department filter hidden for now — keep company + category only
-    // { key: 'department', label: 'Department', icon: 'ri-team-line', allLabel: 'All departments' },
-    { key: 'lineOfBusiness', label: 'Business Functions', icon: 'ri-briefcase-line', allLabel: 'All Functions' },
-    ...(showFunctionType
-      ? [{ key: 'functionType', label: 'Function Type', icon: 'ri-stack-line', allLabel: 'All Function Types' }]
-      : []),
+    ...baseFields,
+    ...(showFunctionType ? [functionTypeField] : []),
   ];
+  const draftFields = [
+    ...baseFields,
+    ...(draftShowFunctionType ? [functionTypeField] : []),
+  ];
+
+  const activeCount =
+    countActiveDimensionFilters(filters) + (portfolioUserFilter ? 1 : 0);
+
+  useEffect(() => {
+    if (sheetOpen) {
+      setDraft({ ...filters, __portfolioUser: portfolioUserFilter || '' });
+    }
+  }, [sheetOpen, filters, portfolioUserFilter]);
+
+  const openSheet = () => {
+    setDraft({ ...filters, __portfolioUser: portfolioUserFilter || '' });
+    setSheetOpen(true);
+  };
+
+  const applyDraft = () => {
+    for (const { key } of draftFields) {
+      if ((draft?.[key] || '') !== (filters?.[key] || '')) onChange(key, draft?.[key] || '');
+    }
+    if (!draftShowFunctionType && filters.functionType) onChange('functionType', '');
+    onChange('period', {
+      mode: draft?.periodMode || 'all',
+      range: { from: draft?.periodFrom || '', to: draft?.periodTo || '' },
+      ranges: Array.isArray(draft?.periodRanges) ? draft.periodRanges : [],
+      parts: Array.isArray(draft?.periodParts) ? draft.periodParts : [],
+      fyStartYear: draft?.periodFyStartYear ?? null,
+      summaryLabel: draft?.periodLabel || 'All time',
+    });
+
+    if (typeof onPortfolioUserChange === 'function') {
+      const draftUser = draft?.__portfolioUser ?? portfolioUserFilter;
+      if (draftUser !== portfolioUserFilter) onPortfolioUserChange(draftUser || '');
+    }
+    setSheetOpen(false);
+  };
+
+  const clearAll = () => {
+    onClear?.();
+    if (typeof onPortfolioUserChange === 'function' && portfolioUserFilter) {
+      onPortfolioUserChange('');
+    }
+    setSheetOpen(false);
+  };
+
+  const draftPeriodState = {
+    mode: draft?.periodMode || 'all',
+    range: { from: draft?.periodFrom || '', to: draft?.periodTo || '' },
+    ranges: Array.isArray(draft?.periodRanges) ? draft.periodRanges : [],
+    parts: Array.isArray(draft?.periodParts) ? draft.periodParts : [],
+    fyStartYear: draft?.periodFyStartYear ?? null,
+    summaryLabel: draft?.periodLabel || 'All time',
+  };
+
+  const chips = [];
+  if (!hideCompanyFunctionFilters) {
+    if (filters.company) {
+      chips.push({ key: 'company', label: filters.company, onRemove: () => onChange('company', '') });
+    }
+    if (filters.lineOfBusiness) {
+      chips.push({
+        key: 'lob',
+        label: filters.lineOfBusiness,
+        onRemove: () => onChange('lineOfBusiness', ''),
+      });
+    }
+    if (filters.functionType) {
+      chips.push({
+        key: 'ft',
+        label: filters.functionType,
+        onRemove: () => onChange('functionType', ''),
+      });
+    }
+  }
+  if (filters.periodMode && filters.periodMode !== 'all') {
+    chips.push({
+      key: 'period',
+      label: filters.periodLabel || 'Period',
+      onRemove: () => onChange('period', getEmptyPeriodState()),
+    });
+  }
+  if (portfolioUserFilter) {
+    chips.push({
+      key: 'user',
+      label: portfolioUserFilter,
+      onRemove: () => onPortfolioUserChange?.(''),
+    });
+  }
 
   return (
     <div className="flex w-full flex-col gap-1.5 lg:w-auto lg:items-end">
-      <div className="flex w-full snap-x snap-mandatory items-end gap-2 overflow-x-auto pb-0.5 [-ms-overflow-style:none] [scrollbar-width:none] lg:flex-wrap lg:justify-end lg:overflow-visible [&::-webkit-scrollbar]:hidden">
+      {/* Mobile: compact Filters button + sheet */}
+      <div className="flex w-full flex-col gap-2 lg:hidden">
+        {prefix ? <div className="w-full">{prefix}</div> : null}
+        <div className="flex w-full gap-2">
+          <MobileFiltersButton count={activeCount} onClick={openSheet} />
+        </div>
+        <MobileActiveFilterChips chips={chips} />
+      </div>
+
+      {/* Desktop: original horizontal / wrap rail — unchanged */}
+      <div className="hidden w-full snap-x snap-mandatory items-end gap-2 overflow-x-auto pb-0.5 [-ms-overflow-style:none] [scrollbar-width:none] lg:flex lg:flex-wrap lg:justify-end lg:overflow-visible [&::-webkit-scrollbar]:hidden">
         {prefix}
         {fields.map(({ key, label, icon, allLabel }) => (
           <label key={key} className="flex min-w-[10.5rem] shrink-0 snap-start flex-col gap-1">
@@ -893,35 +1115,19 @@ function DashboardDimensionFilters({ filters, options, onChange, onClear, hasAct
         ))}
 
         <label className="flex min-w-[11rem] shrink-0 snap-start flex-col gap-1">
-          <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Filter</span>
-          <PtSelect
-            value={filters.createdYear || ''}
-            onChange={(e) => onChange('createdYear', e.target.value)}
-            leadingIcon="ri-calendar-2-line"
-            aria-label="Filter by year"
-            className="w-full sm:min-w-[12rem]"
-            triggerClassName="text-xs sm:text-sm py-2 h-auto min-h-[2.25rem]"
-            options={[
-              { value: '', label: 'All years' },
-              ...(options.createdYear || []),
-            ]}
+          <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Period</span>
+          <DashboardPeriodPicker
+            mode={periodState.mode}
+            range={periodState.range}
+            ranges={periodState.ranges}
+            parts={periodState.parts}
+            fyStartYear={periodState.fyStartYear}
+            summaryLabel={periodState.summaryLabel}
+            onChange={(next) => onChange('period', next)}
+            className="w-full sm:min-w-[11rem]"
+            triggerClassName="rounded-xl bg-white py-2 shadow-sm text-xs sm:text-sm min-h-[2.25rem] sm:min-w-[12rem]"
           />
         </label>
-
-        {filters.createdYear ? (
-          <label className="flex min-w-[11rem] shrink-0 snap-start flex-col gap-1">
-            <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Period</span>
-            <PtSelect
-              value={filters.createdPeriod || ''}
-              onChange={(e) => onChange('createdPeriod', e.target.value)}
-              leadingIcon="ri-calendar-event-line"
-              aria-label="Filter by created period"
-              className="w-full sm:min-w-[12rem]"
-              triggerClassName="text-xs sm:text-sm py-2 h-auto min-h-[2.25rem]"
-              options={createdPeriodOptions}
-            />
-          </label>
-        ) : null}
 
         {suffix}
 
@@ -935,18 +1141,85 @@ function DashboardDimensionFilters({ filters, options, onChange, onClear, hasAct
           </button>
         ) : null}
       </div>
+
       {hasActiveFilters ? (
-        <p className="text-center text-[10px] font-medium text-slate-500 lg:text-right">
+        <p className="hidden text-center text-[10px] font-medium text-slate-500 lg:block lg:text-right">
           Portfolio filters applied across all sections · dates use project created date
         </p>
       ) : null}
+
+      <MobileFilterSheet
+        open={sheetOpen}
+        title="Dashboard filters"
+        onClose={() => setSheetOpen(false)}
+        onClear={clearAll}
+        onApply={applyDraft}
+      >
+        {draftFields.map(({ key, label, icon, allLabel }) => (
+          <MobileFilterField key={key} label={label}>
+            <PtSelect
+              value={draft?.[key] || ''}
+              onChange={(e) => setDraft((prev) => ({ ...prev, [key]: e.target.value }))}
+              leadingIcon={icon}
+              aria-label={`Filter by ${label}`}
+              className="w-full"
+              triggerClassName="text-xs py-2 h-auto min-h-[2.5rem]"
+              options={[
+                { value: '', label: allLabel },
+                ...(options[key] || []).map((opt) => ({ value: opt, label: opt })),
+              ]}
+            />
+          </MobileFilterField>
+        ))}
+        <MobileFilterField label="Period">
+          <DashboardPeriodPicker
+            mode={draftPeriodState.mode}
+            range={draftPeriodState.range}
+            ranges={draftPeriodState.ranges}
+            parts={draftPeriodState.parts}
+            fyStartYear={draftPeriodState.fyStartYear}
+            summaryLabel={draftPeriodState.summaryLabel}
+            onChange={(next) =>
+              setDraft((prev) => ({
+                ...prev,
+                periodMode: next.mode || 'all',
+                periodFrom: next.range?.from || '',
+                periodTo: next.range?.to || '',
+                periodLabel: next.summaryLabel || 'All time',
+                periodRanges: Array.isArray(next.ranges) ? next.ranges : [],
+                periodParts: Array.isArray(next.parts) ? next.parts : [],
+                periodFyStartYear: Number.isFinite(Number(next.fyStartYear))
+                  ? Number(next.fyStartYear)
+                  : null,
+              }))
+            }
+            className="w-full"
+            triggerClassName="rounded-xl bg-white py-2 shadow-sm text-xs min-h-[2.5rem]"
+          />
+        </MobileFilterField>
+        {Array.isArray(portfolioUserOptions) && typeof onPortfolioUserChange === 'function' ? (
+          <MobileFilterField label="User">
+            <PtSelect
+              value={draft?.__portfolioUser ?? portfolioUserFilter}
+              onChange={(e) =>
+                setDraft((prev) => ({ ...prev, __portfolioUser: e.target.value }))
+              }
+              leadingIcon="ri-user-line"
+              aria-label="Filter by user"
+              className="w-full"
+              triggerClassName="text-xs py-2 h-auto min-h-[2.5rem]"
+              options={portfolioUserOptions}
+            />
+          </MobileFilterField>
+        ) : null}
+      </MobileFilterSheet>
     </div>
   );
 }
 
-/** Loads subtask tracker items from Project_Sub_Task_A01. */
+/** Loads task tracker items from Project_Sub_Task_A01 — enrich for Table::Task_History / Revised. */
 async function fetchSubtaskTrackerData(kfInstance) {
-  return fetchTaskTrackerData(kfInstance);
+  return fetchTaskTrackerData(kfInstance, { enrichDetails: true });
 }
 
 /** Normalize Kissflow user field vs display name (assignee / owner). */
@@ -1333,26 +1606,35 @@ const KPI_THEME = {
 };
 
 function PremiumKPICard({ title, value, subtitle, trend, icon, theme, index, onClick, active = false }) {
+  const isDesktop = useIsDesktopLg();
   return (
     <motion.button
       type="button"
       onClick={onClick}
-      initial={{ opacity: 0, y: 18 }}
+      initial={isDesktop ? { opacity: 0, y: 18 } : { opacity: 0, y: 6 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{
-        type: 'spring',
-        stiffness: 380,
-        damping: 28,
-        delay: Math.min(index * 0.035, 0.25),
-      }}
-      whileHover={{
-        y: -6,
-        scale: 1.02,
-        transition: { type: 'spring', stiffness: 420, damping: 22 },
-      }}
-      whileTap={{ scale: 0.985 }}
+      transition={
+        isDesktop
+          ? {
+              type: 'spring',
+              stiffness: 380,
+              damping: 28,
+              delay: Math.min(index * 0.035, 0.25),
+            }
+          : { duration: 0.2, delay: Math.min(index * 0.03, 0.12) }
+      }
+      whileHover={
+        isDesktop
+          ? {
+              y: -6,
+              scale: 1.02,
+              transition: { type: 'spring', stiffness: 420, damping: 22 },
+            }
+          : undefined
+      }
+      whileTap={isDesktop ? { scale: 0.985 } : { scale: 0.99 }}
       className={`
-        group relative flex h-full min-h-[152px] w-full flex-col overflow-hidden rounded-xl border bg-gradient-to-br p-3.5 text-left sm:min-h-[168px] sm:rounded-2xl sm:p-5
+        group relative flex h-full min-h-[112px] w-full flex-col overflow-hidden rounded-xl border bg-gradient-to-br p-3 text-left sm:rounded-2xl sm:p-5 lg:min-h-[168px] lg:p-5
         ${theme.cardBg}
         ${theme.cardShadow}
         transition-[box-shadow,border-color,ring] duration-300 ease-out
@@ -1364,49 +1646,49 @@ function PremiumKPICard({ title, value, subtitle, trend, icon, theme, index, onC
       `}
     >
       <div
-        className="pointer-events-none absolute -right-8 -top-8 h-24 w-24 rounded-full opacity-0 blur-2xl transition-opacity duration-500 group-hover:opacity-100"
+        className="pointer-events-none absolute -right-8 -top-8 hidden h-24 w-24 rounded-full opacity-0 blur-2xl transition-opacity duration-500 group-hover:opacity-100 lg:block"
         style={{ background: theme.glow }}
       />
-      <div className="pointer-events-none absolute inset-0 rounded-2xl bg-gradient-to-br from-white/0 via-transparent to-slate-100/35 opacity-0 transition-opacity duration-500 group-hover:opacity-100" />
+      <div className="pointer-events-none absolute inset-0 hidden rounded-2xl bg-gradient-to-br from-white/0 via-transparent to-slate-100/35 opacity-0 transition-opacity duration-500 group-hover:opacity-100 lg:block" />
 
-      <div className="relative flex flex-1 items-start justify-between gap-3">
+      <div className="relative flex flex-1 items-start justify-between gap-2 sm:gap-3">
         <div className="min-w-0 flex-1">
-          <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-400 sm:text-[11px] sm:tracking-[0.14em]">
+          <p className="text-[9px] font-semibold uppercase tracking-[0.1em] text-slate-400 sm:text-[11px] sm:tracking-[0.14em]">
             {title}
           </p>
           <p
-            className={`mt-1.5 text-3xl font-bold tabular-nums leading-none tracking-tight sm:mt-2 sm:text-4xl ${theme.valueClass}`}
+            className={`mt-1 text-[26px] font-bold tabular-nums leading-none tracking-tight sm:mt-2 sm:text-4xl ${theme.valueClass}`}
           >
             {value}
           </p>
           {subtitle ? (
-            <p className="mt-1.5 text-[11px] font-medium text-slate-400 sm:mt-2 sm:text-xs">{subtitle}</p>
+            <p className="mt-1 line-clamp-2 text-[10px] font-medium text-slate-400 sm:mt-2 sm:text-xs">{subtitle}</p>
           ) : null}
           {trend ? (
             <p
-              className={`mt-2 flex items-center gap-1 text-[11px] font-semibold sm:mt-2.5 sm:text-xs ${trend.positive ? 'text-[#22C55E]' : 'text-[#EF4444]'
+              className={`mt-1.5 flex items-center gap-1 text-[10px] font-semibold sm:mt-2.5 sm:text-xs ${trend.positive ? 'text-[#22C55E]' : 'text-[#EF4444]'
                 }`}
             >
               <i className={`${trend.positive ? 'ri-arrow-up-line' : 'ri-arrow-down-line'} text-xs sm:text-sm`} />
               {trend.value}
             </p>
           ) : null}
-          <p className="mt-2 text-[10px] font-semibold text-[#1E88E5] opacity-0 transition-opacity group-hover:opacity-100">
+          <p className="mt-2 hidden text-[10px] font-semibold text-[#1E88E5] opacity-0 transition-opacity group-hover:opacity-100 lg:block">
             Click to view →
           </p>
         </div>
 
         <div
           className={`
-            relative flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-white/90 sm:h-12 sm:w-12 sm:rounded-xl
+            relative flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-white/90 sm:h-12 sm:w-12 sm:rounded-xl
             ${theme.iconBg}
             ${theme.iconShadow}
             ${theme.iconRing}
             transition-all duration-300 ease-out
-            group-hover:scale-105 group-hover:-rotate-[8deg] group-hover:shadow-[0_10px_22px_-12px_rgba(15,23,42,0.25)]
+            lg:group-hover:scale-105 lg:group-hover:-rotate-[8deg] lg:group-hover:shadow-[0_10px_22px_-12px_rgba(15,23,42,0.25)]
           `}
         >
-          <i className={`${icon} text-lg transition-transform duration-300 group-hover:scale-110 sm:text-xl`} />
+          <i className={`${icon} text-base transition-transform duration-300 lg:group-hover:scale-110 sm:text-xl`} />
         </div>
       </div>
     </motion.button>
@@ -1415,24 +1697,28 @@ function PremiumKPICard({ title, value, subtitle, trend, icon, theme, index, onC
 
 /** Shared grid + min height so Insight and Health Monitor cards align in size only */
 const DASHBOARD_CARD_GRID =
-  'grid grid-cols-1 items-stretch gap-3 sm:grid-cols-2 sm:gap-4 md:gap-5 xl:grid-cols-4';
-const DASHBOARD_CARD_MIN_H = 'min-h-[152px] sm:min-h-[168px]';
+  'grid grid-cols-2 items-stretch gap-2.5 sm:gap-4 md:gap-5 xl:grid-cols-4';
+const DASHBOARD_CARD_MIN_H = 'min-h-[112px] lg:min-h-[168px]';
 
-function AnimatedBar({ widthPct, color, trackClass, delay }) {
+function AnimatedBar({ widthPct, color, trackClass, delay, subtle = false }) {
   const x = Math.min(100, Math.max(0, widthPct)) / 100;
   return (
-    <div className={`h-1.5 w-full overflow-hidden rounded-full ${trackClass}`}>
+    <div className={`${subtle ? 'h-1' : 'h-1.5'} w-full overflow-hidden rounded-full ${trackClass}`}>
       <motion.div
         className="h-full w-full origin-left rounded-full"
         style={{ backgroundColor: color }}
-        initial={{ scaleX: 0 }}
+        initial={{ scaleX: subtle ? x : 0 }}
         animate={{ scaleX: x }}
-        transition={{
-          type: 'spring',
-          stiffness: 120,
-          damping: 18,
-          delay,
-        }}
+        transition={
+          subtle
+            ? { duration: 0.25, delay: Math.min(delay, 0.08) }
+            : {
+                type: 'spring',
+                stiffness: 120,
+                damping: 18,
+                delay,
+              }
+        }
       />
     </div>
   );
@@ -1459,26 +1745,35 @@ function HealthMonitorCard({
   active = false,
   onClick,
 }) {
+  const isDesktop = useIsDesktopLg();
   return (
     <motion.button
       type="button"
       onClick={onClick}
-      initial={{ opacity: 0, y: 18 }}
+      initial={isDesktop ? { opacity: 0, y: 18 } : { opacity: 0, y: 6 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{
-        type: 'spring',
-        stiffness: 380,
-        damping: 28,
-        delay: index * 0.05,
-      }}
-      whileHover={{
-        y: -6,
-        scale: 1.025,
-        transition: { type: 'spring', stiffness: 420, damping: 22 },
-      }}
-      whileTap={{ scale: 0.985 }}
+      transition={
+        isDesktop
+          ? {
+              type: 'spring',
+              stiffness: 380,
+              damping: 28,
+              delay: index * 0.05,
+            }
+          : { duration: 0.2, delay: Math.min(index * 0.03, 0.12) }
+      }
+      whileHover={
+        isDesktop
+          ? {
+              y: -6,
+              scale: 1.025,
+              transition: { type: 'spring', stiffness: 420, damping: 22 },
+            }
+          : undefined
+      }
+      whileTap={isDesktop ? { scale: 0.985 } : { scale: 0.99 }}
       className={`
-        group relative flex h-full w-full flex-col overflow-hidden rounded-xl border bg-gradient-to-br p-3.5 text-left sm:rounded-2xl sm:p-5
+        group relative flex h-full w-full flex-col overflow-hidden rounded-xl border bg-gradient-to-br p-3 text-left sm:rounded-2xl lg:p-5
         ${DASHBOARD_CARD_MIN_H}
         ${active ? 'border-[#1E88E5] ring-2 ring-[#1E88E5]/35' : 'border-slate-200/80'}
         ${cardBg}
@@ -1489,18 +1784,18 @@ function HealthMonitorCard({
       `}
     >
       <div
-        className="pointer-events-none absolute -right-10 -top-10 h-28 w-28 rounded-full opacity-0 blur-2xl transition-opacity duration-500 group-hover:opacity-100"
+        className="pointer-events-none absolute -right-10 -top-10 hidden h-28 w-28 rounded-full opacity-0 blur-2xl transition-opacity duration-500 group-hover:opacity-100 lg:block"
         style={{ background: glow }}
       />
 
-      <div className="relative flex flex-1 flex-col gap-2">
+      <div className="relative flex flex-1 flex-col gap-1.5 lg:gap-2">
         <div className="flex items-start justify-between gap-2">
-          <span className="text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-500 sm:text-[11px] sm:tracking-[0.12em]">
+          <span className="text-[9px] font-semibold uppercase tracking-[0.1em] text-slate-500 sm:text-[11px] sm:tracking-[0.12em]">
             {title}
           </span>
           <motion.span
             className={`inline-flex h-8 w-8 items-center justify-center rounded-lg text-sm sm:h-9 sm:w-9 sm:rounded-xl sm:text-base ${iconWrap} shadow-sm backdrop-blur-sm`}
-            whileHover={{ scale: 1.12, rotate: [0, -6, 6, 0] }}
+            whileHover={isDesktop ? { scale: 1.12, rotate: [0, -6, 6, 0] } : undefined}
             transition={{ duration: 0.45 }}
           >
             {iconClass ? <i className={iconClass} /> : icon}
@@ -1508,22 +1803,37 @@ function HealthMonitorCard({
         </div>
 
         <motion.p
-          className={`text-2xl font-bold tabular-nums tracking-tight sm:text-3xl ${valueColor}`}
-          initial={{ opacity: 0, scale: 0.92 }}
+          className={`text-[26px] font-bold tabular-nums leading-none tracking-tight sm:text-3xl ${valueColor}`}
+          initial={isDesktop ? { opacity: 0, scale: 0.92 } : { opacity: 0 }}
           animate={{ opacity: 1, scale: 1 }}
-          transition={{ type: 'spring', stiffness: 300, damping: 22, delay: 0.08 + index * 0.05 }}
+          transition={
+            isDesktop
+              ? { type: 'spring', stiffness: 300, damping: 22, delay: 0.08 + index * 0.05 }
+              : { duration: 0.2, delay: Math.min(index * 0.03, 0.1) }
+          }
         >
           {value}
         </motion.p>
 
-        <AnimatedBar
-          widthPct={barPct}
-          color={barColor}
-          trackClass={barTrack}
-          delay={0.12 + index * 0.06}
-        />
+        <div className="mt-auto hidden lg:block">
+          <AnimatedBar
+            widthPct={barPct}
+            color={barColor}
+            trackClass={barTrack}
+            delay={0.12 + index * 0.06}
+          />
+        </div>
+        <div className="mt-auto lg:hidden">
+          <AnimatedBar
+            widthPct={barPct}
+            color={barColor}
+            trackClass={barTrack}
+            delay={0.05}
+            subtle
+          />
+        </div>
 
-        <p className="mt-auto text-[11px] font-medium text-slate-500 sm:text-xs">{footnote}</p>
+        <p className="line-clamp-2 text-[10px] font-medium text-slate-500 sm:text-xs">{footnote}</p>
       </div>
     </motion.button>
   );
@@ -1988,17 +2298,6 @@ function resolveProjectBusinessId(project) {
   return displayId || String(project?.id ?? '').trim();
 }
 
-function resolveTaskBusinessIdFromRow(row) {
-  const direct = String(row?.taskId ?? '').trim();
-  if (direct && !direct.startsWith('Pk')) return direct;
-
-  const id = String(row?.id ?? '').trim();
-  if (id && !id.startsWith('Pk')) return id;
-
-  const raw = row?.raw ?? {};
-  return String(raw?.Subtaxk_id || raw?.Task_ID_Formulated || raw?.Task_ID_Hidden || '').trim();
-}
-
 function mapProcessSubtaskItem(item) {
   const raw = item?.raw && typeof item.raw === 'object' ? item.raw : null;
   const summary = String(
@@ -2246,6 +2545,63 @@ function ProjectHealthTable({ data, allTasks, allProcessSubtasks, onOpenTaskPopu
     },
   };
 
+  const [sheetOpen, setSheetOpen] = useState(false);
+  const [draftRag, setDraftRag] = useState(ragFilter);
+  const [draftStatus, setDraftStatus] = useState(statusFilter);
+  const [draftOwner, setDraftOwner] = useState(ownerFilter);
+  const [draftName, setDraftName] = useState(nameFilter);
+
+  const projectFilterCount = [ragFilter, statusFilter, ownerFilter, nameFilter].filter(
+    (v) => v && v !== 'all',
+  ).length;
+
+  const openProjectFilterSheet = () => {
+    setDraftRag(ragFilter);
+    setDraftStatus(statusFilter);
+    setDraftOwner(ownerFilter);
+    setDraftName(nameFilter);
+    setSheetOpen(true);
+  };
+
+  const applyProjectFilters = () => {
+    setRagFilter(draftRag);
+    setStatusFilter(draftStatus);
+    setOwnerFilter(draftOwner);
+    setNameFilter(draftName);
+    setSheetOpen(false);
+  };
+
+  const clearProjectFilters = () => {
+    setRagFilter('all');
+    setStatusFilter('all');
+    setOwnerFilter('all');
+    setNameFilter('all');
+    setDraftRag('all');
+    setDraftStatus('all');
+    setDraftOwner('all');
+    setDraftName('all');
+    setSheetOpen(false);
+  };
+
+  const projectFilterChips = [
+    ragFilter !== 'all'
+      ? { key: 'rag', label: ragFilter, onRemove: () => setRagFilter('all') }
+      : null,
+    statusFilter !== 'all'
+      ? {
+          key: 'status',
+          label: statusFilter === '__active__' ? 'Active' : statusFilter,
+          onRemove: () => setStatusFilter('all'),
+        }
+      : null,
+    ownerFilter !== 'all'
+      ? { key: 'owner', label: ownerFilter, onRemove: () => setOwnerFilter('all') }
+      : null,
+    nameFilter !== 'all'
+      ? { key: 'name', label: nameFilter, onRemove: () => setNameFilter('all') }
+      : null,
+  ].filter(Boolean);
+
   const rowBg = (rag) => {
     if (rag === 'Red') return 'hover:bg-red-50/60';
     if (rag === 'Amber') return 'hover:bg-orange-50/60';
@@ -2257,12 +2613,14 @@ function ProjectHealthTable({ data, allTasks, allProcessSubtasks, onOpenTaskPopu
       className="overflow-hidden rounded-2xl border border-white/80 bg-white/95 shadow-lg shadow-slate-200/40 backdrop-blur-sm lg:rounded-3xl"
     >
       <div className="flex flex-col gap-3 border-b border-slate-100 bg-gradient-to-r from-white to-blue-50/40 px-3 py-3 sm:px-5 sm:py-4 lg:flex-row lg:items-center">
-        <div className="text-center lg:text-left">
+        <div className="text-left">
           <h3 className="text-sm font-semibold text-slate-800 sm:text-base">Project Health Overview</h3>
           <p className="mt-0.5 text-[11px] text-slate-500 sm:text-xs">
             {filtered.length} of {data.length} projects
-            {totalPages > 1 ? ` · ${PAGE_SIZE} per page` : ''}
-            {' · chevron expands · name opens details'}
+            <span className="hidden sm:inline">
+              {totalPages > 1 ? ` · ${PAGE_SIZE} per page` : ''}
+              {' · chevron expands · name opens details'}
+            </span>
           </p>
         </div>
         <div className="flex w-full flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center lg:ml-auto lg:w-auto">
@@ -2273,10 +2631,37 @@ function ProjectHealthTable({ data, allTasks, allProcessSubtasks, onOpenTaskPopu
               placeholder="Search project..."
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              className="w-full rounded-2xl border border-slate-200 bg-white py-2 pl-8 pr-3 text-xs shadow-sm outline-none focus:border-indigo-500"
+              className="min-h-[40px] w-full rounded-xl border border-slate-200 bg-white py-2 pl-8 pr-3 text-xs shadow-sm outline-none focus:border-indigo-500 lg:rounded-2xl"
             />
           </div>
-          <div className="flex snap-x snap-mandatory gap-2 overflow-x-auto pb-1 [-ms-overflow-style:none] [scrollbar-width:none] sm:flex-wrap sm:overflow-visible sm:pb-0 lg:justify-end [&::-webkit-scrollbar]:hidden">
+
+          {/* Mobile Filters + Sort */}
+          <div className="flex w-full gap-2 lg:hidden">
+            <MobileFiltersButton count={projectFilterCount} onClick={openProjectFilterSheet} />
+            <div className="flex min-w-0 flex-[1.2] items-center gap-1.5">
+              <PtSelect
+                value={sortKey}
+                onChange={(e) => setSortKey(e.target.value)}
+                className="min-w-0 flex-1"
+                aria-label="Sort by"
+                options={COLUMN_META.map((col) => ({ value: col.key, label: col.label }))}
+              />
+              <button
+                type="button"
+                onClick={() => setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))}
+                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-700"
+                aria-label={sortDir === 'asc' ? 'Sort descending' : 'Sort ascending'}
+              >
+                <i className={sortDir === 'asc' ? 'ri-sort-asc' : 'ri-sort-desc'} />
+              </button>
+            </div>
+          </div>
+          <div className="lg:hidden">
+            <MobileActiveFilterChips chips={projectFilterChips} />
+          </div>
+
+          {/* Desktop filter rail */}
+          <div className="hidden snap-x snap-mandatory gap-2 overflow-x-auto pb-1 [-ms-overflow-style:none] [scrollbar-width:none] sm:flex-wrap sm:overflow-visible sm:pb-0 lg:flex lg:justify-end [&::-webkit-scrollbar]:hidden">
             <PtSelect
               value={ragFilter}
               onChange={(e) => setRagFilter(e.target.value)}
@@ -2312,28 +2697,62 @@ function ProjectHealthTable({ data, allTasks, allProcessSubtasks, onOpenTaskPopu
             />
             {headerActions}
           </div>
+          {headerActions ? <div className="flex w-full lg:hidden">{headerActions}</div> : null}
         </div>
       </div>
 
-      <div className="flex flex-wrap items-center gap-2 border-b border-slate-100 bg-slate-50/80 px-3 py-2 lg:hidden">
-        <span className="text-[10px] font-bold uppercase tracking-wide text-slate-500">Sort by</span>
-        <PtSelect
-          value={sortKey}
-          onChange={(e) => setSortKey(e.target.value)}
-          className="min-w-0 flex-1"
-          aria-label="Sort by"
-          options={COLUMN_META.map((col) => ({ value: col.key, label: col.label }))}
-        />
-        <button
-          type="button"
-          onClick={() => setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))}
-          className="flex h-8 shrink-0 items-center gap-1 rounded-xl border border-slate-200 bg-white px-2.5 text-[11px] font-semibold text-slate-700"
-          aria-label={sortDir === 'asc' ? 'Sort descending' : 'Sort ascending'}
-        >
-          <i className={sortDir === 'asc' ? 'ri-sort-asc' : 'ri-sort-desc'} />
-          {sortDir === 'asc' ? 'A–Z' : 'Z–A'}
-        </button>
-      </div>
+      <MobileFilterSheet
+        open={sheetOpen}
+        title="Project filters"
+        onClose={() => setSheetOpen(false)}
+        onClear={clearProjectFilters}
+        onApply={applyProjectFilters}
+      >
+        <MobileFilterField label="RAG">
+          <PtSelect
+            value={draftRag}
+            onChange={(e) => setDraftRag(e.target.value)}
+            className="w-full"
+            options={[
+              { value: 'all', label: 'All RAG' },
+              { value: 'Red', label: '🔴 Red' },
+              { value: 'Amber', label: '🟡 Amber' },
+              { value: 'Green', label: '🟢 Green' },
+            ]}
+          />
+        </MobileFilterField>
+        <MobileFilterField label="Status">
+          <PtSelect
+            value={draftStatus}
+            onChange={(e) => setDraftStatus(e.target.value)}
+            className="w-full"
+            options={[
+              { value: 'all', label: 'All Status' },
+              { value: '__active__', label: 'Active (not completed)' },
+              ...statuses.map((s) => ({ value: s, label: s })),
+            ]}
+          />
+        </MobileFilterField>
+        <MobileFilterField label="Owner">
+          <PtSelect
+            value={draftOwner}
+            onChange={(e) => setDraftOwner(e.target.value)}
+            className="w-full"
+            options={[
+              { value: 'all', label: 'All Owners' },
+              ...owners.map((o) => ({ value: o, label: o })),
+            ]}
+          />
+        </MobileFilterField>
+        <MobileFilterField label="Project">
+          <PtSelect
+            value={draftName}
+            onChange={(e) => setDraftName(e.target.value)}
+            className="w-full"
+            options={columnFilterProps.name.filterOptions}
+          />
+        </MobileFilterField>
+      </MobileFilterSheet>
 
       <div className="hidden overflow-x-auto lg:block">
         <table className="w-full">
@@ -2414,12 +2833,7 @@ function ProjectHealthTable({ data, allTasks, allProcessSubtasks, onOpenTaskPopu
                     </div>
                   </td>
                   <td className="cursor-pointer px-5 py-3" onClick={() => toggleExpand(row)}>
-                    <div className="flex items-center gap-2">
-                      <div className="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full bg-[#1E88E5] text-xs font-bold text-white">
-                        {row.ownerAvatar}
-                      </div>
-                      <span className="whitespace-nowrap text-sm text-[#2C3E50]">{row.owner}</span>
-                    </div>
+                    <PtUserAvatar name={row.owner} initials={row.ownerAvatar} />
                   </td>
                   <td className="cursor-pointer px-5 py-3" onClick={() => toggleExpand(row)}>
                     <span className="whitespace-nowrap text-sm text-[#2C3E50]">{row.startDate || '—'}</span>
@@ -2477,7 +2891,7 @@ function ProjectHealthTable({ data, allTasks, allProcessSubtasks, onOpenTaskPopu
         </table>
       </div>
 
-      <div className="space-y-2.5 p-2.5 sm:space-y-3 sm:p-3 lg:hidden">
+      <div className="space-y-2.5 p-3 sm:space-y-3 sm:p-3 lg:hidden">
         {filtered.length === 0 && (
           <div className="rounded-xl border border-slate-200 bg-slate-50 p-5 text-center text-xs text-slate-500 sm:text-sm">
             No projects found
@@ -2488,89 +2902,94 @@ function ProjectHealthTable({ data, allTasks, allProcessSubtasks, onOpenTaskPopu
           return (
           <div
             key={row.id}
-            className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm ring-1 ring-slate-100 sm:rounded-2xl"
+            className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm"
           >
-            <div className="w-full p-3 text-left sm:p-4">
-            <div className="flex items-start justify-between gap-2 border-b border-slate-100 pb-2">
+            <div className="w-full p-3 text-left">
+            <div className="flex items-start justify-between gap-2">
               <div className="min-w-0 flex-1">
             <button
               type="button"
                   onClick={() => onOpenProjectPopup?.(row)}
                   className="block w-full min-w-0 text-left"
             >
-                  <p className="truncate text-sm font-semibold text-slate-800 hover:text-[#1E88E5] hover:underline">{row.name}</p>
-                <p className="mt-0.5 text-[10px] leading-relaxed text-slate-500">
+                  <p className="truncate text-sm font-semibold text-slate-800">{row.name}</p>
+                <p className="mt-0.5 truncate text-[10px] leading-relaxed text-slate-500">
                   {formatProjectRef(row.displayId, row.id)} · {row.lineOfBusiness}
                 </p>
                 </button>
               </div>
               <div className="flex shrink-0 items-start gap-1.5">
+                <div className="origin-top-right scale-90">
+                  <RAGCell rag={row.rag} />
+                </div>
                 <button
                   type="button"
                   onClick={() => toggleExpand(row)}
                   aria-expanded={open}
                   aria-label={`${open ? 'Collapse' : 'Expand'} ${row.name}`}
-                  className="flex h-7 w-7 items-center justify-center rounded-md text-slate-400 transition hover:bg-slate-100 hover:text-[#1E88E5]"
+                  className="flex h-10 w-10 items-center justify-center rounded-xl text-slate-400 transition hover:bg-slate-100 hover:text-[#1E88E5]"
                 >
                   <i
-                    className={`ri-arrow-down-s-line text-lg transition-transform duration-200 ${open ? 'rotate-180' : ''}`}
+                    className={`ri-arrow-down-s-line text-xl transition-transform duration-200 ${open ? 'rotate-180' : ''}`}
                   aria-hidden
                 />
                 </button>
-                <div className="scale-90 origin-top-right">
-                  <RAGCell rag={row.rag} />
-                </div>
               </div>
             </div>
-            <button type="button" onClick={() => toggleExpand(row)} className="mt-2 w-full text-left">
-            <div className="flex items-center gap-2 text-[11px]">
-              <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[#1E88E5] text-[10px] font-bold text-white">
-                {row.ownerAvatar}
-              </div>
-              <div className="min-w-0">
-                <span className="text-[10px] font-medium uppercase tracking-wide text-slate-400">Owner</span>
-                <p className="truncate font-medium text-slate-800">{row.owner}</p>
-              </div>
+            <div className="mt-2.5 space-y-1.5 text-[11px]">
+            <div className="flex items-center gap-2">
+              <PtUserAvatar name={row.owner} initials={row.ownerAvatar} />
+              <span className="text-[10px] font-medium uppercase tracking-wide text-slate-400">Owner</span>
             </div>
-            <div className="mt-2 grid grid-cols-1 gap-1.5 text-[11px]">
-              <div className="flex items-center justify-between gap-2 rounded-lg bg-slate-50 px-2.5 py-1.5">
+              <div className="flex items-center justify-between gap-2 py-0.5">
                 <span className="shrink-0 text-slate-500">Start date</span>
                 <span className="min-w-0 truncate text-right font-medium text-slate-800">{row.startDate || '—'}</span>
               </div>
-              <div className="flex items-center justify-between gap-2 rounded-lg bg-slate-50 px-2.5 py-1.5">
+              <div className="flex items-center justify-between gap-2 py-0.5">
                 <span className="shrink-0 text-slate-500">End date</span>
                 <span className="min-w-0 truncate text-right font-medium text-slate-800">{row.revisedEndDate ?? row.originalEndDate}</span>
               </div>
               {row.delayDays > 0 ? (
                 <p className="text-end text-[10px] font-medium text-[#E53935]">+{row.delayDays}d delay</p>
               ) : null}
-              <div className="flex items-center justify-between gap-2 rounded-lg bg-slate-50 px-2.5 py-1.5">
+              {row.revisedCount > 0 ? (
+              <div className="flex items-center justify-between gap-2 py-0.5">
                 <span className="text-slate-500">Revised</span>
-                {row.revisedCount > 0 ? (
                   <span className="inline-flex items-center gap-1 rounded-full bg-orange-50 px-2 py-0.5 text-[10px] font-semibold text-[#FB8C00]">
                     <i className="ri-refresh-line text-[10px]" />
                     {row.revisedCount}×
                   </span>
-                ) : (
-                  <span className="text-slate-400">—</span>
-                )}
               </div>
-              <div className="rounded-lg bg-slate-50 px-2.5 py-2">
-                <span className="text-[10px] font-medium uppercase tracking-wide text-slate-400">Progress</span>
-                <div className="mt-1">
+              ) : null}
+              <div className="py-0.5">
+                <span className="mb-1 block text-slate-500">Progress</span>
                   <ProgressCell value={row.progress} compact />
-                </div>
               </div>
-              <div className="flex items-center justify-between gap-2 rounded-lg bg-slate-50 px-2.5 py-1.5">
+              <div className="flex items-center justify-between gap-2 py-0.5">
                 <span className="text-slate-500">Status</span>
                 <StatusCell status={row.status} />
               </div>
             </div>
-            </button>
+            <div className="mt-2.5 flex items-center justify-between gap-2 border-t border-slate-100 pt-2">
+              <button
+                type="button"
+                onClick={() => onOpenProjectPopup?.(row)}
+                className="inline-flex min-h-[36px] items-center rounded-lg px-2 text-[11px] font-semibold text-[#1E88E5]"
+              >
+                View details
+              </button>
+              <button
+                type="button"
+                onClick={() => toggleExpand(row)}
+                className="inline-flex min-h-[36px] items-center gap-1 rounded-lg px-2 text-[11px] font-semibold text-slate-600"
+              >
+                {open ? 'Hide' : 'Expand'}
+                <i className={`ri-arrow-down-s-line transition-transform ${open ? 'rotate-180' : ''}`} aria-hidden />
+              </button>
+            </div>
             </div>
             {open ? (
-              <div className="border-t border-slate-100 bg-slate-50/80">
-                <div className="max-h-[min(75vh,40rem)] overflow-y-auto">
+              <div className="border-t border-slate-200/80 bg-slate-100/70">
                   <ProjectDrillDownPanel
                     project={row}
                     allTasks={allTasks}
@@ -2582,7 +3001,6 @@ function ProjectHealthTable({ data, allTasks, allProcessSubtasks, onOpenTaskPopu
                     onRefreshTasks={onRefreshTasks}
                     refreshingTasks={refreshingTasks}
                   />
-                </div>
               </div>
             ) : null}
           </div>
@@ -3003,6 +3421,10 @@ function TaskDetailFormView({ row, viewerName = 'User', isSubtask = false }) {
 
   const f = resolveTaskFormFields(row);
   const from = f.fromName || viewerName || 'User';
+  const revisionHistory = Array.isArray(row?.revisionHistory) ? row.revisionHistory : [];
+  const hasRevision = Boolean(row?.hasRevision && row?.revisedEndDate);
+  const revisionEntries = hasRevision ? revisionHistory.slice(1) : [];
+  const revisedCount = Number(row?.revisedCount) || revisionEntries.length;
 
   return (
     <div className="space-y-3 sm:space-y-3.5">
@@ -3072,13 +3494,22 @@ function TaskDetailFormView({ row, viewerName = 'User', isSubtask = false }) {
       </DetailSectionCard>
 
       <DetailSectionCard title="Schedule" icon="ri-calendar-schedule-line" accent="blue">
-        <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+        <div className={`grid grid-cols-1 gap-2 sm:grid-cols-2 ${hasRevision ? 'lg:grid-cols-4' : 'lg:grid-cols-3'}`}>
           <DetailTile label="Start date">
             <DetailValue>{f.startDate}</DetailValue>
           </DetailTile>
-          <DetailTile label="End date" highlight={f.status === 'Overdue' || Number(row?.delayDays) > 0}>
-            <DetailValue highlight={f.status === 'Overdue' || Number(row?.delayDays) > 0}>{f.endDate}</DetailValue>
+          <DetailTile label={hasRevision ? 'Previous end date' : 'End date'} highlight={!hasRevision && (f.status === 'Overdue' || Number(row?.delayDays) > 0)}>
+            <DetailValue highlight={!hasRevision && (f.status === 'Overdue' || Number(row?.delayDays) > 0)}>
+              {hasRevision
+                ? (row?.previousEndDate || row?.originalEndDate || f.endDate)
+                : f.endDate}
+            </DetailValue>
           </DetailTile>
+          {hasRevision ? (
+            <DetailTile label="Latest revised end date" highlight>
+              <DetailValue highlight>{row.revisedEndDate}</DetailValue>
+            </DetailTile>
+          ) : null}
           <DetailTile label="Delay" highlight={Number(row?.delayDays) > 0}>
             <DetailValue highlight={Number(row?.delayDays) > 0}>
               {Number(row?.delayDays) > 0 ? `+${row.delayDays} days` : 'On time'}
@@ -3092,6 +3523,41 @@ function TaskDetailFormView({ row, viewerName = 'User', isSubtask = false }) {
           {f.detailText || <span className="text-slate-400">No details provided</span>}
         </div>
       </DetailSectionCard>
+
+      {revisionEntries.length > 0 ? (
+        <DetailSectionCard
+          title={`Revision history (${revisedCount})`}
+          icon="ri-history-line"
+          accent="rose"
+        >
+          <div className="space-y-1.5">
+            {revisionEntries.map((rev, idx) => (
+              <div
+                key={rev.key || `${rev.date}-${idx}`}
+                className="rounded-lg border border-slate-200/90 bg-white px-2.5 py-2 shadow-[0_1px_2px_rgba(15,23,42,0.04)]"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <p className="text-[12px] text-slate-600">
+                    Updated on: <span className="font-medium text-slate-800">{rev.date || '—'}</span>
+                  </p>
+                  <p className="text-[11px] text-slate-500">{rev.revisedBy || 'System'}</p>
+                </div>
+                <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[12px] text-slate-600">
+                  <p>
+                    Previous end date:{' '}
+                    <span className="font-medium text-slate-500 line-through">{rev.previousEndDate || '—'}</span>
+                  </p>
+                  <i className="ri-arrow-right-line text-[11px] text-[#FB8C00]" aria-hidden />
+                  <p>
+                    Updated end date:{' '}
+                    <span className="font-semibold text-[#FB8C00]">{rev.newEndDate || '—'}</span>
+                  </p>
+                </div>
+              </div>
+            ))}
+          </div>
+        </DetailSectionCard>
+      ) : null}
     </div>
   );
 }
@@ -3338,7 +3804,7 @@ function DelayRevisionDetailView({ row }) {
 }
 
 /** In-app detail modal — compact fields + themed contrast. */
-function DashboardDetailModal({ detail, onClose, viewerName = 'User' }) {
+function DashboardDetailModal({ detail, onClose, viewerName = 'User', onOpenKissflowForm = null }) {
   useEffect(() => {
     if (!detail) return undefined;
     const onKey = (e) => {
@@ -3360,6 +3826,7 @@ function DashboardDetailModal({ detail, onClose, viewerName = 'User' }) {
   const isSubtask = type === 'subtask';
   const isTaskLike = isTask || isSubtask;
   const row = detail?.row;
+  const canOpenKissflow = isTask && typeof onOpenKissflowForm === 'function';
 
   return createPortal(
     <AnimatePresence>
@@ -3393,14 +3860,14 @@ function DashboardDetailModal({ detail, onClose, viewerName = 'User' }) {
                 <p className="text-[11px] font-medium uppercase tracking-wide text-slate-400">
                   {isTaskLike ? (isSubtask ? 'Subtask' : 'Task') : 'Project'}
                 </p>
-            <button
-              type="button"
+                <button
+                  type="button"
                   onClick={onClose}
                   className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-500 shadow-sm transition hover:bg-slate-50 hover:text-slate-800"
                   aria-label="Close details"
                 >
                   <i className="ri-close-line text-lg" aria-hidden />
-            </button>
+                </button>
               </div>
 
               <div className="min-h-0 flex-1 overflow-y-auto px-3.5 py-3.5 sm:px-5 sm:py-4">
@@ -3411,17 +3878,27 @@ function DashboardDetailModal({ detail, onClose, viewerName = 'User' }) {
                 )}
               </div>
 
-              <div className="flex shrink-0 justify-end border-t border-slate-200/80 bg-white px-4 py-2.5 sm:px-5">
-            <button
-              type="button"
+              <div className="flex shrink-0 flex-wrap items-center justify-end gap-2 border-t border-slate-200/80 bg-white px-4 py-2.5 sm:px-5">
+                <button
+                  type="button"
                   onClick={onClose}
-                  className="inline-flex h-9 items-center justify-center rounded-xl bg-[#1E88E5] px-4 text-xs font-semibold text-white shadow-sm transition hover:bg-[#1565C0]"
+                  className="inline-flex h-9 items-center justify-center rounded-xl border border-slate-200 bg-white px-4 text-xs font-semibold text-slate-700 shadow-sm transition hover:bg-slate-50"
                 >
                   Close
-            </button>
-          </div>
+                </button>
+                {canOpenKissflow ? (
+                  <button
+                    type="button"
+                    onClick={() => onOpenKissflowForm(row)}
+                    className="inline-flex h-9 items-center justify-center gap-1.5 rounded-xl bg-[#1E88E5] px-4 text-xs font-semibold text-white shadow-sm transition hover:bg-[#1565C0]"
+                  >
+                    <i className="ri-external-link-line" aria-hidden />
+                    Open form
+                  </button>
+                ) : null}
+              </div>
             </motion.div>
-        </div>
+          </div>
         </motion.div>
       ) : null}
     </AnimatePresence>,
@@ -3667,18 +4144,91 @@ function SubtaskTable({
   const allPageSelected = bulkSelectEnabled && pageRowIds.length > 0
     && pageRowIds.every((id) => selectedRowIds?.has?.(id));
 
+  const [taskSheetOpen, setTaskSheetOpen] = useState(false);
+  const [draftStatus, setDraftStatus] = useState(statusFilter);
+  const [draftProject, setDraftProject] = useState(projectFilter);
+  const [draftTaskName, setDraftTaskName] = useState(taskNameFilter);
+  const [draftAssignee, setDraftAssignee] = useState(assigneeFilter);
+
+  const taskFilterCount = [
+    statusFilter !== 'all',
+    !hideProjectFilter && projectFilter !== 'all',
+    taskNameFilter !== 'all',
+    assigneeFilter !== 'all',
+  ].filter(Boolean).length;
+
+  const openTaskFilterSheet = () => {
+    setDraftStatus(statusFilter);
+    setDraftProject(projectFilter);
+    setDraftTaskName(taskNameFilter);
+    setDraftAssignee(assigneeFilter);
+    setTaskSheetOpen(true);
+  };
+
+  const applyTaskFilters = () => {
+    setStatusFilter(draftStatus);
+    setProjectFilter(draftProject);
+    setTaskNameFilter(draftTaskName);
+    setAssigneeFilter(draftAssignee);
+    setTaskSheetOpen(false);
+  };
+
+  const clearTaskFilters = () => {
+    setStatusFilter('all');
+    setProjectFilter('all');
+    setTaskNameFilter('all');
+    setAssigneeFilter('all');
+    setDraftStatus('all');
+    setDraftProject('all');
+    setDraftTaskName('all');
+    setDraftAssignee('all');
+    setTaskSheetOpen(false);
+  };
+
+  const taskChips = [
+    statusFilter !== 'all'
+      ? {
+          key: 'status',
+          label:
+            statusFilter === '__open__'
+              ? 'Open'
+              : statusFilter === '__high_priority__'
+                ? 'High priority'
+                : statusFilter === '__delayed__'
+                  ? 'Delayed'
+                  : statusFilter,
+          onRemove: () => setStatusFilter('all'),
+        }
+      : null,
+    !hideProjectFilter && projectFilter !== 'all'
+      ? {
+          key: 'project',
+          label: projectFilter === '__individual__' ? 'Individual' : projectFilter,
+          onRemove: () => setProjectFilter('all'),
+        }
+      : null,
+    taskNameFilter !== 'all'
+      ? { key: 'task', label: taskNameFilter, onRemove: () => setTaskNameFilter('all') }
+      : null,
+    assigneeFilter !== 'all'
+      ? { key: 'assignee', label: assigneeFilter, onRemove: () => setAssigneeFilter('all') }
+      : null,
+  ].filter(Boolean);
+
   return (
     <div
       className={`overflow-hidden rounded-2xl ${compact ? 'border border-slate-200 bg-white shadow-sm' : 'border border-white/80 bg-white/95 shadow-lg shadow-slate-200/40 backdrop-blur-sm'} lg:rounded-3xl`}
     >
       <div className={`flex flex-col gap-3 border-b border-slate-100 bg-gradient-to-r from-white to-indigo-50/40 px-3 py-3 sm:px-5 sm:py-4 lg:flex-row lg:items-center ${compact ? 'sm:py-3' : ''}`}>
         {!hideTitle ? (
-          <div className="text-center lg:text-left">
+          <div className="text-left">
             <h3 className="text-sm font-semibold text-slate-800 sm:text-base">Task Tracker</h3>
             <p className="mt-0.5 text-[11px] text-slate-500 sm:text-xs">
               {total} tasks
-              {totalPages > 1 ? ` · ${PAGE_SIZE} per page` : ''}
-              {' · tap a row for details'}
+              <span className="hidden sm:inline">
+                {totalPages > 1 ? ` · ${PAGE_SIZE} per page` : ''}
+                {' · tap a row for details'}
+              </span>
             </p>
           </div>
         ) : (
@@ -3697,10 +4247,31 @@ function SubtaskTable({
               placeholder="Search task..."
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              className={`w-full rounded-2xl border border-slate-200 bg-white py-2 pl-8 pr-3 outline-none focus:border-indigo-500 ${compact ? 'text-[11px]' : 'text-[11px]'} sm:text-xs`}
+              className={`min-h-[40px] w-full rounded-xl border border-slate-200 bg-white py-2 pl-8 pr-3 outline-none focus:border-indigo-500 lg:rounded-2xl ${compact ? 'text-[11px]' : 'text-[11px]'} sm:text-xs`}
             />
           </div>
-          <div className="flex snap-x snap-mandatory items-center gap-2 overflow-x-auto pb-1 [-ms-overflow-style:none] [scrollbar-width:none] sm:flex-wrap sm:overflow-visible sm:pb-0 [&::-webkit-scrollbar]:hidden">
+
+          <div className="flex w-full gap-2 lg:hidden">
+            <MobileFiltersButton count={taskFilterCount} onClick={openTaskFilterSheet} />
+            {typeof onRefresh === 'function' ? (
+              <button
+                type="button"
+                aria-label="Refresh tasks"
+                disabled={refreshing}
+                onClick={() => onRefresh()}
+                className="inline-flex min-h-[40px] shrink-0 items-center justify-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 text-[11px] font-semibold text-[#2C3E50]"
+              >
+                <i className={`ri-refresh-line text-sm ${refreshing ? 'animate-spin' : ''}`} aria-hidden />
+                {refreshing ? '…' : 'Refresh'}
+              </button>
+            ) : null}
+          </div>
+          <div className="lg:hidden">
+            <MobileActiveFilterChips chips={taskChips} />
+          </div>
+          {headerActions ? <div className="w-full lg:hidden">{headerActions}</div> : null}
+
+          <div className="hidden snap-x snap-mandatory items-center gap-2 overflow-x-auto pb-1 [-ms-overflow-style:none] [scrollbar-width:none] sm:flex-wrap sm:overflow-visible sm:pb-0 lg:flex [&::-webkit-scrollbar]:hidden">
             <PtSelect
               value={statusFilter}
               onChange={(e) => setStatusFilter(e.target.value)}
@@ -3733,6 +4304,39 @@ function SubtaskTable({
           </div>
         </div>
       </div>
+
+      <MobileFilterSheet
+        open={taskSheetOpen}
+        title="Task filters"
+        onClose={() => setTaskSheetOpen(false)}
+        onClear={clearTaskFilters}
+        onApply={applyTaskFilters}
+      >
+        <MobileFilterField label="Status">
+          <PtSelect value={draftStatus} onChange={(e) => setDraftStatus(e.target.value)} className="w-full" options={statusOptions} />
+        </MobileFilterField>
+        {!hideProjectFilter ? (
+          <MobileFilterField label="Project">
+            <PtSelect value={draftProject} onChange={(e) => setDraftProject(e.target.value)} className="w-full" options={projectOptions} />
+          </MobileFilterField>
+        ) : null}
+        <MobileFilterField label="Task">
+          <PtSelect
+            value={draftTaskName}
+            onChange={(e) => setDraftTaskName(e.target.value)}
+            className="w-full"
+            options={columnFilterProps.taskName.filterOptions}
+          />
+        </MobileFilterField>
+        <MobileFilterField label="Assignee">
+          <PtSelect
+            value={draftAssignee}
+            onChange={(e) => setDraftAssignee(e.target.value)}
+            className="w-full"
+            options={columnFilterProps.assignedTo.filterOptions}
+          />
+        </MobileFilterField>
+      </MobileFilterSheet>
 
       <div className="hidden overflow-x-auto lg:block">
         <table className="w-full">
@@ -3846,12 +4450,12 @@ function SubtaskTable({
                   </td>
                   ) : null}
                   <td className={compact ? 'px-4 py-2.5' : 'px-5 py-3'}>
-                    <div className="flex items-center gap-2">
-                      <div className="flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-full bg-[#1E88E5]/10 text-xs font-bold text-[#1E88E5]">
-                        {row.assigneeAvatar.slice(0, 2)}
-                      </div>
-                      <span className={`whitespace-nowrap text-[#2C3E50] ${compact ? 'text-[12px]' : 'text-sm'}`}>{row.assignedTo}</span>
-                    </div>
+                    <PtUserAvatar
+                      name={row.assignedTo}
+                      initials={row.assigneeAvatar}
+                      sizeClass={compact ? 'h-6 w-6' : 'h-7 w-7'}
+                      textClass={compact ? 'text-[10px]' : 'text-[11px]'}
+                    />
                   </td>
                   <td className={compact ? 'px-4 py-2.5' : 'px-5 py-3'}>
                     <span className={`whitespace-nowrap text-[#2C3E50] ${compact ? 'text-[12px]' : 'text-sm'}`}>{row.startDate}</span>
@@ -3923,7 +4527,7 @@ function SubtaskTable({
         </table>
       </div>
 
-      <div className="space-y-2.5 p-2.5 sm:space-y-3 sm:p-3 lg:hidden">
+      <div className="space-y-2 p-3 lg:hidden">
         {pageRows.length === 0 && (
           <div className="rounded-xl border border-slate-200 bg-slate-50 p-5 text-center text-xs text-slate-500">No tasks found</div>
         )}
@@ -3936,7 +4540,7 @@ function SubtaskTable({
           return (
           <div
             key={row.id}
-            className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm ring-1 ring-slate-100 sm:rounded-2xl"
+            className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm"
           >
           <button
             type="button"
@@ -3944,12 +4548,15 @@ function SubtaskTable({
               const opened = typeof onOpenPopup === 'function' ? onOpenPopup(row) : false;
               if (!opened) onRowClick?.(row);
             }}
-            className="w-full p-3 text-left transition active:scale-[0.99] sm:p-4"
+            className="w-full p-3 text-left"
           >
-            <div className="flex items-start justify-between gap-2 border-b border-slate-100 pb-2">
+            <div className="flex items-start justify-between gap-2">
               <div className="min-w-0 flex-1">
-                <p className="text-[10px] font-medium uppercase tracking-wide text-[#1E88E5]">Task</p>
-                <p className="truncate text-sm font-semibold text-slate-800">{row.taskName}</p>
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-[10px] font-semibold uppercase tracking-wide text-[#1E88E5]">Task</p>
+                  <StatusBadge status={row.status} />
+                </div>
+                <p className="mt-1 truncate text-sm font-semibold text-slate-800">{row.taskName}</p>
                 <p className="mt-1">
                   {(!isEmptyProjectName(row.projectName) || String(row.projectId || '').trim()) ? (
                     <span className="truncate text-[11px] font-medium text-[#1E88E5]">
@@ -3961,39 +4568,34 @@ function SubtaskTable({
                     </span>
                   )}
                 </p>
-                {nestedMode && childSubtasks.length > 0 ? (
-                  <p className="mt-0.5 text-[10px] font-medium text-[#FB8C00]">{childSubtasks.length} subtask{childSubtasks.length === 1 ? '' : 's'}</p>
-                ) : null}
               </div>
               {showNested ? (
                 <button
                   type="button"
                   aria-label={isExpanded ? 'Collapse subtasks' : 'Expand subtasks'}
                   onClick={(e) => toggleTaskExpand(row.id, e)}
-                  className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-slate-400 transition hover:bg-slate-100"
+                  className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl text-slate-400 transition hover:bg-slate-100"
                 >
                   <i className={`ri-arrow-${isExpanded ? 'down' : 'right'}-s-line text-lg`} aria-hidden />
                 </button>
               ) : null}
             </div>
             {!hideTaskIds ? (
-              <p className="text-[10px] text-slate-400">{row.taskId || row.id}</p>
+              <p className="mt-1 truncate text-[10px] text-slate-400">{row.taskId || row.id}</p>
             ) : null}
-            <div className="mt-2 grid grid-cols-1 gap-1.5 text-[11px]">
-              <div className="flex items-center gap-2 rounded-lg bg-slate-50 px-2.5 py-1.5">
-                <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[#1E88E5]/10 text-[10px] font-bold text-[#1E88E5]">
-                  {row.assigneeAvatar.slice(0, 2)}
-                </div>
+            <div className="mt-2.5 space-y-1.5 border-t border-slate-100 pt-2 text-[11px]">
+              <div className="flex items-center gap-2">
+                <PtUserAvatar name={row.assignedTo} initials={row.assigneeAvatar} />
                 <div className="min-w-0">
-                  <span className="text-[10px] text-slate-500">Assignee</span>
-                  <p className="truncate font-medium text-slate-800">{row.assignedTo}</p>
+                  <span className="block text-[10px] text-slate-400">Assignee</span>
+                  <span className="truncate font-medium text-slate-700">{row.assignedTo || '—'}</span>
                 </div>
               </div>
-              <div className="flex items-center justify-between rounded-lg bg-slate-50 px-2.5 py-1.5">
+              <div className="flex items-center justify-between py-0.5">
                 <span className="text-slate-500">Start</span>
                 <span className="font-medium text-slate-800">{row.startDate}</span>
               </div>
-              <div className="flex items-center justify-between rounded-lg bg-slate-50 px-2.5 py-1.5">
+              <div className="flex items-center justify-between py-0.5">
                 <span className="text-slate-500">End</span>
                 <div className="text-right">
                   <p className="font-medium text-slate-800">
@@ -4004,25 +4606,24 @@ function SubtaskTable({
                   ) : null}
                 </div>
               </div>
-              <div className="flex items-center justify-between rounded-lg bg-slate-50 px-2.5 py-1.5">
+              {row.revisedCount > 0 ? (
+              <div className="flex items-center justify-between py-0.5">
                 <span className="text-slate-500">Revised</span>
-                {row.revisedCount > 0 ? (
                   <span className="inline-flex items-center gap-1 rounded-full bg-orange-50 px-2 py-0.5 text-[10px] font-semibold text-[#FB8C00]">
                     <i className="ri-refresh-line text-[10px]" />
                     {row.revisedCount}×
                   </span>
-                ) : (
-                  <span className="text-[10px] text-slate-400">—</span>
-                )}
               </div>
-              <div className="flex items-center justify-between rounded-lg bg-slate-50 px-2.5 py-1.5">
-                <span className="text-slate-500">Status</span>
-                <StatusBadge status={row.status} />
-              </div>
+              ) : null}
+              {nestedMode && childSubtasks.length > 0 ? (
+                <p className="pt-0.5 text-[11px] font-semibold text-[#FB8C00]">
+                  {childSubtasks.length} subtask{childSubtasks.length === 1 ? '' : 's'} ›
+                </p>
+              ) : null}
             </div>
           </button>
           {showNested && isExpanded ? (
-            <div className="space-y-2 border-t border-slate-100 bg-slate-50/80 px-3 py-3 sm:px-4">
+            <div className="space-y-1.5 border-t border-slate-200/70 bg-slate-100/60 px-2.5 py-2.5">
               {childSubtasks.length === 0 ? (
                 <p className="text-[11px] text-[#7F8C8D]">No subtasks yet.</p>
               ) : (
@@ -4040,7 +4641,7 @@ function SubtaskTable({
                 <button
                   type="button"
                   onClick={() => onCreateSubtask(row)}
-                  className="inline-flex items-center gap-1.5 rounded-2xl border border-[#1E88E5]/30 bg-[#E8F0FE] px-3 py-1.5 text-[11px] font-semibold text-[#1E88E5]"
+                  className="inline-flex min-h-[36px] items-center gap-1.5 rounded-xl border border-[#1E88E5]/30 bg-white px-3 py-1.5 text-[11px] font-semibold text-[#1E88E5]"
                 >
                   <i className="ri-add-line" aria-hidden />
                   Add subtask
@@ -4068,6 +4669,10 @@ function DelayRevisionSection({ data, onRowClick, insightFilter = null }) {
   const [sortKey, setSortKey] = useState('delayDays');
   const [sortDir, setSortDir] = useState('desc');
   const [page, setPage] = useState(1);
+  const [delaySheetOpen, setDelaySheetOpen] = useState(false);
+  const [draftDelayRag, setDraftDelayRag] = useState('all');
+  const [draftDelayType, setDraftDelayType] = useState('all');
+  const [draftDelayName, setDraftDelayName] = useState('all');
 
   useEffect(() => {
     if (!insightFilter?.token) return;
@@ -4171,6 +4776,51 @@ function DelayRevisionSection({ data, onRowClick, insightFilter = null }) {
     rag: { filterValue: ragFilter, onFilterChange: setRagFilter, filterOptions: ragOptions },
   };
 
+  const delayTypeOptions = [
+    { value: 'all', label: 'All' },
+    { value: 'delayed', label: 'Delayed only' },
+    { value: 'revised', label: 'Revised only' },
+    { value: 'both', label: 'Delayed + revised' },
+  ];
+
+  const delayFilterCount = [ragFilter, typeFilter, nameFilter].filter((v) => v && v !== 'all').length;
+
+  const openDelayFilterSheet = () => {
+    setDraftDelayRag(ragFilter);
+    setDraftDelayType(typeFilter);
+    setDraftDelayName(nameFilter);
+    setDelaySheetOpen(true);
+  };
+
+  const applyDelayFilters = () => {
+    setRagFilter(draftDelayRag);
+    setTypeFilter(draftDelayType);
+    setNameFilter(draftDelayName);
+    setDelaySheetOpen(false);
+  };
+
+  const clearDelayFilters = () => {
+    setRagFilter('all');
+    setTypeFilter('all');
+    setNameFilter('all');
+    setDraftDelayRag('all');
+    setDraftDelayType('all');
+    setDraftDelayName('all');
+    setDelaySheetOpen(false);
+  };
+
+  const delayChips = [
+    ragFilter !== 'all' ? { key: 'rag', label: ragFilter, onRemove: () => setRagFilter('all') } : null,
+    typeFilter !== 'all'
+      ? {
+          key: 'type',
+          label: delayTypeOptions.find((o) => o.value === typeFilter)?.label || typeFilter,
+          onRemove: () => setTypeFilter('all'),
+        }
+      : null,
+    nameFilter !== 'all' ? { key: 'name', label: nameFilter, onRemove: () => setNameFilter('all') } : null,
+  ].filter(Boolean);
+
   return (
     <div
       className="overflow-hidden rounded-2xl border border-slate-200/70 bg-white shadow-sm lg:rounded-3xl lg:border-white/80 lg:bg-white/95 lg:shadow-lg lg:shadow-slate-200/40 lg:backdrop-blur-sm"
@@ -4192,10 +4842,22 @@ function DelayRevisionSection({ data, onRowClick, insightFilter = null }) {
               placeholder="Search project..."
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              className="w-full rounded-2xl border border-slate-200 bg-white py-2 pl-8 pr-3 text-xs shadow-sm outline-none focus:border-indigo-500"
+              className="min-h-[40px] w-full rounded-xl border border-slate-200 bg-white py-2 pl-8 pr-3 text-xs shadow-sm outline-none focus:border-indigo-500 lg:rounded-2xl"
             />
           </div>
-          <div className="flex snap-x snap-mandatory gap-2 overflow-x-auto pb-1 [-ms-overflow-style:none] [scrollbar-width:none] sm:flex-wrap sm:overflow-visible sm:pb-0 lg:justify-end [&::-webkit-scrollbar]:hidden">
+
+          <div className="flex w-full gap-2 lg:hidden">
+            <MobileFiltersButton count={delayFilterCount} onClick={openDelayFilterSheet} />
+            <span className="inline-flex min-h-[40px] shrink-0 items-center justify-center gap-1.5 rounded-xl bg-red-50 px-3 text-[11px] font-semibold text-[#E53935]">
+              <i className="ri-alarm-warning-line" aria-hidden />
+              {total}
+            </span>
+          </div>
+          <div className="lg:hidden">
+            <MobileActiveFilterChips chips={delayChips} />
+          </div>
+
+          <div className="hidden snap-x snap-mandatory gap-2 overflow-x-auto pb-1 [-ms-overflow-style:none] [scrollbar-width:none] sm:flex-wrap sm:overflow-visible sm:pb-0 lg:flex lg:justify-end [&::-webkit-scrollbar]:hidden">
             <PtSelect
               value={ragFilter}
               onChange={(e) => setRagFilter(e.target.value)}
@@ -4208,12 +4870,7 @@ function DelayRevisionSection({ data, onRowClick, insightFilter = null }) {
               onChange={(e) => setTypeFilter(e.target.value)}
               className="min-w-[8rem] shrink-0"
               aria-label="Filter by delay type"
-              options={[
-                { value: 'all', label: 'All' },
-                { value: 'delayed', label: 'Delayed only' },
-                { value: 'revised', label: 'Revised only' },
-                { value: 'both', label: 'Delayed + revised' },
-              ]}
+              options={delayTypeOptions}
             />
             <span className="inline-flex items-center justify-center gap-1.5 self-center rounded-full bg-red-50 px-3 py-1 text-[11px] font-semibold text-[#E53935] sm:self-auto sm:text-xs">
               <i className="ri-alarm-warning-line" aria-hidden />
@@ -4222,6 +4879,42 @@ function DelayRevisionSection({ data, onRowClick, insightFilter = null }) {
           </div>
         </div>
       </div>
+
+      <MobileFilterSheet
+        open={delaySheetOpen}
+        title="Delay filters"
+        onClose={() => setDelaySheetOpen(false)}
+        onClear={clearDelayFilters}
+        onApply={applyDelayFilters}
+      >
+        <MobileFilterField label="RAG">
+          <PtSelect
+            value={draftDelayRag}
+            onChange={(e) => setDraftDelayRag(e.target.value)}
+            className="w-full"
+            aria-label="Filter by RAG"
+            options={ragOptions}
+          />
+        </MobileFilterField>
+        <MobileFilterField label="Type">
+          <PtSelect
+            value={draftDelayType}
+            onChange={(e) => setDraftDelayType(e.target.value)}
+            className="w-full"
+            aria-label="Filter by delay type"
+            options={delayTypeOptions}
+          />
+        </MobileFilterField>
+        <MobileFilterField label="Project">
+          <PtSelect
+            value={draftDelayName}
+            onChange={(e) => setDraftDelayName(e.target.value)}
+            className="w-full"
+            aria-label="Filter by project"
+            options={nameOptions}
+          />
+        </MobileFilterField>
+      </MobileFilterSheet>
 
       <div className="hidden overflow-x-auto lg:block">
         <table className="w-full">
@@ -4391,8 +5084,30 @@ function ProjectDrillDownPanel({
   ];
 
   return (
-    <div className="flex min-h-0 flex-col bg-white">
-      <div className="flex shrink-0 gap-1 overflow-x-auto border-b border-gray-100 bg-white px-3 [-ms-overflow-style:none] [scrollbar-width:none] sm:px-4 [&::-webkit-scrollbar]:hidden">
+    <div className="flex min-h-0 flex-col bg-transparent">
+      {/* Mobile segmented control */}
+      <div className="shrink-0 p-3 lg:hidden">
+        <div className="grid grid-cols-2 gap-0.5 rounded-xl border border-slate-200 bg-white p-0.5">
+          {tabs.map((tab) => (
+            <button
+              key={tab.key}
+              type="button"
+              onClick={() => setActiveTab(tab.key)}
+              className={`inline-flex min-h-[40px] items-center justify-center gap-1.5 rounded-lg px-2 text-[11px] font-semibold transition ${
+                activeTab === tab.key
+                  ? 'bg-[#E8F0FE] text-[#1E62F0]'
+                  : 'text-slate-600'
+              }`}
+            >
+              <i className={tab.icon} aria-hidden />
+              {tab.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Desktop underline tabs */}
+      <div className="hidden shrink-0 gap-1 overflow-x-auto border-b border-gray-100 bg-white px-3 [-ms-overflow-style:none] [scrollbar-width:none] sm:px-4 lg:flex [&::-webkit-scrollbar]:hidden">
         {tabs.map((tab) => (
           <button
             key={tab.key}
@@ -4409,7 +5124,7 @@ function ProjectDrillDownPanel({
         ))}
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
+      <div className="min-h-0 flex-1 p-3 sm:p-6 lg:overflow-y-auto">
         {activeTab === 'subtasks' && (
           <div className="space-y-3">
             <SubtaskTable
@@ -4439,7 +5154,7 @@ function ProjectDrillDownPanel({
                       setCreatingTask(false);
                     }
                   }}
-                  className="shrink-0 inline-flex items-center gap-2 rounded-2xl bg-[#1E88E5] px-3 py-2 text-[11px] font-semibold text-white shadow-sm transition hover:opacity-95 disabled:cursor-not-allowed disabled:opacity-60 sm:text-xs"
+                  className="inline-flex w-full min-h-[40px] shrink-0 items-center justify-center gap-2 rounded-xl bg-[#1E88E5] px-3 py-2 text-[11px] font-semibold text-white shadow-sm transition hover:opacity-95 disabled:cursor-not-allowed disabled:opacity-60 sm:w-auto sm:rounded-2xl sm:text-xs lg:w-auto"
                 >
                   <i className="ri-add-line" aria-hidden />
                   {creatingTask ? 'Creating…' : 'Create task'}
@@ -4567,6 +5282,8 @@ function DashboardPagePremium({
   projectsScopeOwnerOnly = false,
   /** Skip outer page shell when nested inside UserHubPage. */
   embeddedInHub = false,
+  /** Hide Company / Business Functions / Function Type dimension filters. */
+  hideCompanyFunctionFilters = false,
   /** User hub welcome card props — rendered inline with dimension filters. */
   hubWelcome = null,
   /** User hub — open create popup from table toolbar (no row params). */
@@ -4575,6 +5292,8 @@ function DashboardPagePremium({
   /** When set, row click opens Kissflow popup instead of detail modal (UserHub only). */
   onOpenProjectRow = null,
   onOpenTaskRow = null,
+  /** UserHubTasks only — nested subtask open/create uses Popup_WbcLURdUXx. */
+  onOpenSubtaskRow = null,
   taskBulkSelectEnabled = false,
   taskSelectedRowIds = null,
   onTaskToggleRowSelect = null,
@@ -4600,27 +5319,56 @@ function DashboardPagePremium({
   const [myTeamProjectsLoading, setMyTeamProjectsLoading] = useState(false);
   const [myTeamTasksLoading, setMyTeamTasksLoading] = useState(false);
   const [myTeamError, setMyTeamError] = useState(null);
-  const [dimensionFilters, setDimensionFilters] = useState({
-    company: '',
-    department: '',
-    lineOfBusiness: '',
-    functionType: '',
-    createdYear: '',
-    createdPeriod: '',
+  const [dimensionFilters, setDimensionFilters] = useState(() => {
+    const emptyPeriod = getEmptyPeriodState();
+    return {
+      company: '',
+      department: '',
+      lineOfBusiness: '',
+      functionType: '',
+      periodMode: emptyPeriod.mode,
+      periodFrom: emptyPeriod.range.from,
+      periodTo: emptyPeriod.range.to,
+      periodLabel: emptyPeriod.summaryLabel,
+      periodRanges: [],
+      periodParts: [],
+      periodFyStartYear: null,
+      createdYear: '',
+      createdPeriod: '',
+    };
   });
   const [detailModal, setDetailModal] = useState(null);
   const [insightFocus, setInsightFocus] = useState(null);
   const sectionRefs = useRef({});
   const headerRef = useRef(null);
   const insightPulseTimerRef = useRef(null);
+  const isDesktopLg = useIsDesktopLg();
 
   const userEmail = String(scopeUser?.Email || scopeUser?.email || kfInstance?.user?.Email || '').trim();
   const userId = String(scopeUser?._id || scopeUser?.Id || kfInstance?.user?._id || kfInstance?.user?.Id || '').trim();
   const scopingUser = scopeUser || kfInstance?.user;
   const isMyTeamView = scopeToCurrentUser && userViewScope === 'My Team';
+  /** User Hub tasks: table rows come from myitems/pending/participated — skip heavy report portfolio. */
+  const lightHubTasksMode =
+    Boolean(embeddedInHub) && contentView === 'tasks' && overrideTasks != null;
 
   const reloadDashboardData = useCallback(async () => {
     if (!kfInstance?.api) return;
+
+    // mis-table-style hub: only load process subtasks for nested accordion (no project/task reports).
+    if (lightHubTasksMode) {
+      setApiProjectData([]);
+      setApiSubtaskData([]);
+      try {
+        const processSubtasksRes = await fetchAllSubtasks(kfInstance);
+        setApiProcessSubtaskData((processSubtasksRes?.items ?? []).map(mapProcessSubtaskItem));
+      } catch (error) {
+        console.warn('Hub process subtasks fetch failed:', error?.message || error);
+        setApiProcessSubtaskData([]);
+      }
+      return;
+    }
+
     const [projectsRes, subtasksRes, processSubtasksRes] = await Promise.allSettled([
       fetchProjectDashboardData(kfInstance),
       fetchSubtaskTrackerData(kfInstance),
@@ -4640,12 +5388,14 @@ function DashboardPagePremium({
     setApiProjectData(rows);
     setApiSubtaskData(subtasks);
     setApiProcessSubtaskData(processSubtasks);
-  }, [kfInstance]);
+  }, [kfInstance, lightHubTasksMode]);
 
   const handleOpenTaskDetail = useCallback((row) => {
     if (!row) return false;
-    if (typeof onOpenTaskRow === 'function') {
-      return onOpenTaskRow(row, kfInstance) !== false;
+    // Hub tasks go straight to the Kissflow form; in-app detail is the fallback
+    // when the popup can't open (missing InstanceID / ActivityID).
+    if (typeof onOpenTaskRow === 'function' && onOpenTaskRow(row, kfInstance) !== false) {
+      return true;
     }
     setDetailModal({ type: 'task', row });
     return true;
@@ -4653,9 +5403,12 @@ function DashboardPagePremium({
 
   const handleOpenSubtaskDetail = useCallback((row) => {
     if (!row) return false;
+    if (typeof onOpenSubtaskRow === 'function') {
+      return onOpenSubtaskRow(row, kfInstance) !== false;
+    }
     setDetailModal({ type: 'subtask', row });
     return true;
-  }, []);
+  }, [onOpenSubtaskRow, kfInstance]);
 
   const handleOpenProjectDetail = useCallback((row) => {
     if (!row) return false;
@@ -4735,10 +5488,10 @@ function DashboardPagePremium({
   const handleCreateSubtaskForTask = useCallback(
     async (taskRow) => {
       if (isTaskCompleted(taskRow?.status)) {
-    const sdk = kfInstance ?? ((typeof kf !== 'undefined' ? kf : null) ?? (typeof window !== 'undefined' ? window.kf : null));
+        const sdk = kfInstance ?? ((typeof kf !== 'undefined' ? kf : null) ?? (typeof window !== 'undefined' ? window.kf : null));
         sdk?.client?.showInfo?.('Cannot add a subtask to a completed task.');
-      return false;
-    }
+        return false;
+      }
 
       const sdk = kfInstance ?? ((typeof kf !== 'undefined' ? kf : null) ?? (typeof window !== 'undefined' ? window.kf : null));
       if (!sdk) {
@@ -4746,7 +5499,8 @@ function DashboardPagePremium({
         return false;
       }
 
-      const taskId = resolveTaskBusinessIdFromRow(taskRow);
+      // Hub myitems/pending often omit Subtaxk_id — resolve or fetch once from instance.
+      const taskId = await ensureTaskBusinessIdForCreate(sdk, taskRow);
       if (!taskId) {
         sdk?.client?.showInfo?.('Missing task id on this row (expected e.g. Task-PRJ-...).');
         return false;
@@ -4758,22 +5512,40 @@ function DashboardPagePremium({
       dashboardRowCreateLock.add(lockKey);
       try {
         const created = await createSubtaskInstance(sdk, taskId);
+        const draftRow = {
+          InstanceID: created.instanceId,
+          ActivityID: created.activityInstanceId,
+          id: created.instanceId,
+          _id: created.instanceId,
+          _activity_instance_id: created.activityInstanceId,
+        };
+
+        // UserHubTasks: Popup_WbcLURdUXx; elsewhere: process openForm.
+        if (typeof onOpenSubtaskRow === 'function') {
+          const opened = onOpenSubtaskRow(draftRow, kfInstance);
+          if (opened === false) {
+            sdk?.client?.showInfo?.('Subtask created but the form could not be opened.');
+          }
+          void reloadDashboardData();
+          return true;
+        }
+
         void openSubtaskDraft(sdk, created.instanceId, created.activityInstanceId)
           .then(() => reloadDashboardData())
           .catch((openError) => {
             console.warn('Open subtask draft failed:', openError);
             sdk?.client?.showInfo?.(openError?.message || 'Failed to open subtask form.');
           });
-      return true;
+        return true;
       } catch (error) {
         console.warn('Create subtask failed:', error);
         sdk?.client?.showInfo?.(error?.message || 'Failed to create subtask.');
-      return false;
+        return false;
       } finally {
         dashboardRowCreateLock.delete(lockKey);
-    }
+      }
     },
-    [kfInstance, reloadDashboardData],
+    [kfInstance, reloadDashboardData, onOpenSubtaskRow],
   );
 
   /** Offset by sticky header height so section titles aren't hidden under the bar */
@@ -4850,7 +5622,7 @@ function DashboardPagePremium({
       if (!isMyTeamView) return;
       if (!kfInstance?.user) return;
 
-      const cacheKey = `userDashboard:myTeamProjects:v1:${String(userEmail || userId || 'me').toLowerCase()}`;
+      const cacheKey = `userDashboard:myTeamProjects:v2:${String(userEmail || userId || 'me').toLowerCase()}`;
       let hasCache = false;
       try {
         const cached = JSON.parse(sessionStorage.getItem(cacheKey) || 'null');
@@ -4904,7 +5676,7 @@ function DashboardPagePremium({
         });
       });
 
-      const cacheKey = `userDashboard:myTeamTasks:v2:${String(userEmail || userId || 'me').toLowerCase()}`;
+      const cacheKey = `userDashboard:myTeamTasks:v3:${String(userEmail || userId || 'me').toLowerCase()}`;
       let hasCache = false;
       try {
         const cached = JSON.parse(sessionStorage.getItem(cacheKey) || 'null');
@@ -5186,10 +5958,40 @@ function DashboardPagePremium({
 
   const filteredProcessSubtaskData = userFilteredPortfolio.processSubtasks;
 
+  /**
+   * Nested accordion pool for the main tasks table.
+   * Hub override tasks (myitems/pending) are not the report task set, so re-key
+   * process subtasks against the rows actually shown in the table.
+   */
+  const nestedProcessSubtasksForTable = useMemo(() => {
+    if (overrideTasks != null) {
+      return filterProcessSubtasksByTaskKeys(apiProcessSubtaskData, filteredSubtaskData);
+    }
+    return filteredProcessSubtaskData;
+  }, [overrideTasks, apiProcessSubtaskData, filteredSubtaskData, filteredProcessSubtaskData]);
+
   const hasActiveFilters = hasActiveDimensionFilters(dimensionFilters) || Boolean(portfolioUserFilter);
 
   const handleDimensionFilterChange = useCallback((key, value) => {
     setDimensionFilters((prev) => {
+      if (key === 'period') {
+        const nextPeriod = value && typeof value === 'object' ? value : getEmptyPeriodState();
+        return {
+          ...prev,
+          periodMode: nextPeriod.mode || 'all',
+          periodFrom: nextPeriod.range?.from || '',
+          periodTo: nextPeriod.range?.to || '',
+          periodLabel: nextPeriod.summaryLabel || 'All time',
+          periodRanges: Array.isArray(nextPeriod.ranges) ? nextPeriod.ranges : [],
+          periodParts: Array.isArray(nextPeriod.parts) ? nextPeriod.parts : [],
+          periodFyStartYear: Number.isFinite(Number(nextPeriod.fyStartYear))
+            ? Number(nextPeriod.fyStartYear)
+            : null,
+          // Clear legacy year/period selects when using the adaptive picker.
+          createdYear: '',
+          createdPeriod: '',
+        };
+      }
       const next = { ...prev, [key]: value };
       if (key === 'lineOfBusiness' && !isInformationTechnologyCategory(value)) {
         next.functionType = '';
@@ -5202,16 +6004,37 @@ function DashboardPagePremium({
   }, []);
 
   const handleClearDimensionFilters = useCallback(() => {
+    const emptyPeriod = getEmptyPeriodState();
     setPortfolioUserFilter('');
     setDimensionFilters({
       company: '',
       department: '',
       lineOfBusiness: '',
       functionType: '',
+      periodMode: emptyPeriod.mode,
+      periodFrom: emptyPeriod.range.from,
+      periodTo: emptyPeriod.range.to,
+      periodLabel: emptyPeriod.summaryLabel,
+      periodRanges: [],
+      periodParts: [],
+      periodFyStartYear: null,
       createdYear: '',
       createdPeriod: '',
     });
   }, []);
+
+  const portfolioUserSelectOptions = showPortfolioUserFilter
+    ? [
+        {
+          value: '',
+          label: portfolioUsers.length > 0 ? `All Users (${portfolioUsers.length})` : 'All Users',
+        },
+        ...portfolioUsers.map((m) => ({
+          value: m.name,
+          label: m.name,
+        })),
+      ]
+    : null;
 
   const portfolioUserFilterControl = showPortfolioUserFilter ? (
     <label className="flex min-w-[11rem] shrink-0 snap-start flex-col gap-1">
@@ -5223,19 +6046,17 @@ function DashboardPagePremium({
         aria-label="Filter by user"
         className="w-full sm:min-w-[12rem]"
         triggerClassName="text-xs sm:text-sm py-2 h-auto min-h-[2.25rem]"
-        options={[
-          {
-            value: '',
-            label: portfolioUsers.length > 0 ? `All Users (${portfolioUsers.length})` : 'All Users',
-          },
-          ...portfolioUsers.map((m) => ({
-            value: m.name,
-            label: m.name,
-          })),
-        ]}
+        options={portfolioUserSelectOptions}
       />
     </label>
   ) : null;
+
+  const dimensionFilterExtraProps = {
+    portfolioUserFilter,
+    onPortfolioUserChange: showPortfolioUserFilter ? setPortfolioUserFilter : null,
+    portfolioUserOptions: portfolioUserSelectOptions,
+    hideCompanyFunctionFilters,
+  };
 
   const totalProjects = filteredProjectData.length;
   const activeProjects = filteredProjectData.filter((p) => !isProjectClosed(p.status)).length;
@@ -5258,16 +6079,20 @@ function DashboardPagePremium({
     trendDelayedProjects: `${Math.round((delayedProjects / Math.max(totalProjects, 1)) * 100)}% at risk`,
   };
   const content = (
-    <div className={embeddedInHub ? 'min-w-0' : 'bg-gradient-to-b from-[#edf1ff] via-[#f6f8ff] to-[#f2ecff]'}>
-      <div className={embeddedInHub ? 'min-w-0' : 'p-2 pb-6 sm:p-6'}>
+    <div className={embeddedInHub ? 'min-w-0 overflow-x-clip' : 'overflow-x-clip bg-gradient-to-b from-[#edf1ff] via-[#f6f8ff] to-[#f2ecff]'}>
+      <div className={embeddedInHub ? 'min-w-0' : 'p-3 pb-6 sm:p-6'}>
         {!hideWelcomeHeader ? (
         <motion.header
           ref={headerRef}
           data-dashboard-header
-          className="sticky top-0 z-30 -mx-2 mb-3 border-b border-white/50 bg-gradient-to-b from-[#edf1ff]/92 to-[#eef2ff]/88 px-2 pb-2.5 pt-2 shadow-[0_8px_30px_-18px_rgba(30,41,59,0.2)] backdrop-blur-md sm:-mx-6 sm:mb-5 sm:px-6 sm:pb-4 sm:pt-3"
-          initial={{ opacity: 0, y: -12 }}
+          className="sticky top-0 z-30 -mx-3 mb-3 border-b border-white/50 bg-gradient-to-b from-[#edf1ff]/92 to-[#eef2ff]/88 px-3 pb-2.5 pt-2 shadow-[0_8px_30px_-18px_rgba(30,41,59,0.2)] backdrop-blur-md sm:-mx-6 sm:mb-5 sm:px-6 sm:pb-4 sm:pt-3"
+          initial={{ opacity: 0, y: isDesktopLg ? -12 : -4 }}
           animate={{ opacity: 1, y: 0 }}
-          transition={{ type: 'spring', stiffness: 220, damping: 26 }}
+          transition={
+            isDesktopLg
+              ? { type: 'spring', stiffness: 220, damping: 26 }
+              : { duration: 0.2 }
+          }
         >
           <div className="mx-auto flex max-w-[1800px] flex-col gap-2.5 lg:flex-row lg:items-center lg:justify-between lg:gap-6">
             <div className="min-w-0 shrink text-center lg:w-auto lg:py-0.5 lg:text-left">
@@ -5302,14 +6127,15 @@ function DashboardPagePremium({
                 onChange={handleDimensionFilterChange}
                 onClear={handleClearDimensionFilters}
                 hasActiveFilters={hasActiveFilters}
+                {...dimensionFilterExtraProps}
                 prefix={
                   <>
                     {toolbarPrefix}
                     {scopeToCurrentUser && !hideUserScopeToggle ? (
-                    <>
-                      <label className="flex w-max shrink-0 snap-start flex-col gap-1">
+                    <div className="flex w-full flex-col gap-2 lg:contents">
+                      <label className="flex w-full shrink-0 flex-col gap-1 lg:w-max lg:snap-start">
                         <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">View</span>
-                        <div className="inline-flex h-9 items-stretch rounded-xl border border-slate-200 bg-white p-0.5 shadow-sm">
+                        <div className="inline-flex h-10 w-full items-stretch rounded-xl border border-slate-200 bg-white p-0.5 shadow-sm lg:h-9 lg:w-auto">
                           {['Me', 'My Team'].map((x) => (
                             <button
                               key={x}
@@ -5318,7 +6144,7 @@ function DashboardPagePremium({
                                 setUserViewScope(x);
                                 if (x === 'Me') setSelectedTeamMember('');
                               }}
-                              className={`whitespace-nowrap rounded-lg px-3.5 text-[11px] font-semibold transition-all ${
+                              className={`min-h-[36px] flex-1 whitespace-nowrap rounded-lg px-3.5 text-[11px] font-semibold transition-all lg:flex-none ${
                                 userViewScope === x
                                   ? 'bg-[#1E62F0] text-white shadow-sm'
                                   : 'bg-transparent text-slate-700 hover:bg-slate-50'
@@ -5331,7 +6157,7 @@ function DashboardPagePremium({
                       </label>
 
                       {isMyTeamView ? (
-                        <label className="flex min-w-[11rem] shrink-0 snap-start flex-col gap-1">
+                        <label className="flex w-full min-w-0 shrink-0 flex-col gap-1 lg:min-w-[11rem] lg:snap-start">
                           <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">
                             Team Member
                           </span>
@@ -5341,7 +6167,7 @@ function DashboardPagePremium({
                               Loading…
                             </div>
                           ) : myTeamError && teamMembers.length === 0 ? (
-                            <div className="inline-flex min-h-[2.25rem] max-w-[14rem] items-center gap-2 rounded-xl border border-rose-200 bg-rose-50/80 px-3 text-[11px] font-semibold text-rose-700 shadow-sm">
+                            <div className="inline-flex min-h-[2.25rem] max-w-full items-center gap-2 rounded-xl border border-rose-200 bg-rose-50/80 px-3 text-[11px] font-semibold text-rose-700 shadow-sm lg:max-w-[14rem]">
                               <i className="ri-error-warning-line shrink-0" aria-hidden />
                               <span className="truncate">Unable to load team</span>
                             </div>
@@ -5351,7 +6177,7 @@ function DashboardPagePremium({
                               onChange={(e) => setSelectedTeamMember(e.target.value)}
                               leadingIcon="ri-team-line"
                               aria-label="Filter by team member"
-                              className="w-full sm:min-w-[12rem]"
+                              className="w-full lg:min-w-[12rem]"
                               triggerClassName="text-xs sm:text-sm py-2 h-auto min-h-[2.25rem]"
                               options={[
                                 {
@@ -5370,7 +6196,7 @@ function DashboardPagePremium({
                           )}
                         </label>
                       ) : null}
-                    </>
+                    </div>
                     ) : null}
                   </>
                 }
@@ -5445,6 +6271,7 @@ function DashboardPagePremium({
                   onChange={handleDimensionFilterChange}
                   onClear={handleClearDimensionFilters}
                   hasActiveFilters={hasActiveFilters}
+                  {...dimensionFilterExtraProps}
                   prefix={toolbarPrefix}
                   suffix={portfolioUserFilterControl}
                 />
@@ -5459,13 +6286,14 @@ function DashboardPagePremium({
               onChange={handleDimensionFilterChange}
               onClear={handleClearDimensionFilters}
               hasActiveFilters={hasActiveFilters}
+              {...dimensionFilterExtraProps}
               prefix={toolbarPrefix}
               suffix={portfolioUserFilterControl}
             />
           </div>
         )}
 
-        <div className="space-y-3 lg:space-y-6">
+        <div className="space-y-4 lg:space-y-6">
           {(contentView === 'all' || contentView === 'projects') && (
           <motion.section
             ref={(el) => { sectionRefs.current.kpi = el; }}
@@ -5615,11 +6443,11 @@ function DashboardPagePremium({
           >
             <div className="overflow-hidden rounded-2xl border border-white/60 bg-white/50 shadow-sm backdrop-blur-sm lg:rounded-3xl">
               {taskTableToolbar ? (
-                <div className="border-b border-slate-200/60 bg-gradient-to-r from-slate-50/70 to-white/40 px-2.5 py-2.5 sm:px-3 sm:py-3">
+                <div className="min-w-0 border-b border-slate-200/60 bg-gradient-to-r from-slate-50/70 to-white/40 px-3 py-3 sm:px-3 sm:py-3">
                   {taskTableToolbar}
                 </div>
               ) : null}
-              <div className={taskTableToolbar ? '' : ''}>
+              <div className="min-w-0">
                 {overrideTasksLoading ? (
                   <div className="flex min-h-[12rem] items-center justify-center bg-white/70 px-4 py-10 text-sm font-medium text-slate-600">
                     <i className="ri-loader-4-line mr-2 animate-spin text-lg" aria-hidden />
@@ -5629,6 +6457,10 @@ function DashboardPagePremium({
                   <SubtaskTable
                     data={filteredSubtaskData}
                     onOpenPopup={handleOpenTaskDetail}
+                    onOpenSubtaskPopup={handleOpenSubtaskDetail}
+                    nestedMode
+                    allProcessSubtasks={nestedProcessSubtasksForTable}
+                    onCreateSubtask={handleCreateSubtaskForTask}
                     bulkSelectEnabled={taskBulkSelectEnabled}
                     selectedRowIds={taskSelectedRowIds}
                     onToggleRowSelect={onTaskToggleRowSelect}
@@ -5685,7 +6517,12 @@ function DashboardPagePremium({
           )}
         </div>
 
-        <DashboardDetailModal detail={detailModal} onClose={handleCloseDetailModal} viewerName={userName} />
+        <DashboardDetailModal
+          detail={detailModal}
+          onClose={handleCloseDetailModal}
+          viewerName={userName}
+          onOpenKissflowForm={typeof onOpenTaskRow === 'function' ? (row) => onOpenTaskRow(row, kfInstance) : null}
+        />
 
       </div>
     </div>
@@ -5714,11 +6551,13 @@ export default function ProjectDashboardPage({
   scopeUser = null,
   projectsScopeOwnerOnly = false,
   embeddedInHub = false,
+  hideCompanyFunctionFilters = false,
   hubWelcome = null,
   onCreateProjectRecord = null,
   onCreateTaskRecord = null,
   onOpenProjectRow = null,
   onOpenTaskRow = null,
+  onOpenSubtaskRow = null,
   taskBulkSelectEnabled = false,
   taskSelectedRowIds = null,
   onTaskToggleRowSelect = null,
@@ -5741,11 +6580,13 @@ export default function ProjectDashboardPage({
       scopeUser={scopeUser}
       projectsScopeOwnerOnly={projectsScopeOwnerOnly}
       embeddedInHub={embeddedInHub}
+      hideCompanyFunctionFilters={hideCompanyFunctionFilters}
       hubWelcome={hubWelcome}
       onCreateProjectRecord={onCreateProjectRecord}
       onCreateTaskRecord={onCreateTaskRecord}
       onOpenProjectRow={onOpenProjectRow}
       onOpenTaskRow={onOpenTaskRow}
+      onOpenSubtaskRow={onOpenSubtaskRow}
       taskBulkSelectEnabled={taskBulkSelectEnabled}
       taskSelectedRowIds={taskSelectedRowIds}
       onTaskToggleRowSelect={onTaskToggleRowSelect}

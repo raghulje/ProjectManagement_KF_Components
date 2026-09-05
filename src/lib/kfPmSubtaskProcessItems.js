@@ -1,17 +1,15 @@
 /**
- * Task process APIs — mis-table-kf pattern (light + parallel):
- * - Tasks Created by Me  (My Items)     → myitems/status/count + myitems/{segment}?page
- * - Tasks Assigned to me (My Tasks)     → pending/activity/count + pending/{id} (parallel)
- * - Assigned Closed      (Participated) → participated/activity/count + list (parallel)
+ * Subtask process APIs — same myitems / pending / participated shape as UserHub tasks,
+ * scoped to Sub_Task_Process_A00 (SUBTASKS_ENTITY).
  */
 
 import { getApiBase } from '../apiBase.js';
 import { buildPmProcessApiPaths } from './kfPmMyItemsPaths.js';
-import { TASKS_ENTITY } from './pmMyItemsEntities.js';
-import { mapAdminTaskRow, enrichRawTaskRowsWithInstanceDetail } from './kfTaskTracker.js';
+import { SUBTASKS_ENTITY } from './pmMyItemsEntities.js';
+import { mapAdminSubtaskRow, enrichRawSubtaskRowsWithInstanceDetail } from './kfSubtaskTracker.js';
 import { runWithConcurrency } from './kfRuntime.js';
 
-export const HUB_TASK_PAGE_SIZE = 50;
+export const HUB_SUBTASK_PAGE_SIZE = 50;
 const ACTIVITY_LIST_CONCURRENCY = 6;
 const ACTIVITY_CACHE_TTL_MS = 15_000;
 
@@ -42,7 +40,7 @@ function writeCache(key, data) {
   activityCache[key] = { at: Date.now(), data };
 }
 
-export function invalidateHubTaskCaches() {
+export function invalidateHubSubtaskCaches() {
   activityCache.pending = { at: 0, data: null };
   activityCache.participated = { at: 0, data: null };
   activityCache.statusCounts = { at: 0, data: null };
@@ -93,17 +91,16 @@ function dedupeRawRows(rows) {
   return unique;
 }
 
-async function mapRowsWithRevisionDetail(kfInstance, rows) {
+async function mapRawSubtaskRows(kfInstance, rows) {
   const unique = dedupeRawRows(rows);
-  // Pull Table::Task_History via instance/activity + access keys (same as Postman).
-  const enriched = await enrichRawTaskRowsWithInstanceDetail(kfInstance, unique, {
-    maxRows: HUB_TASK_PAGE_SIZE,
+  const enriched = await enrichRawSubtaskRowsWithInstanceDetail(kfInstance, unique, {
+    maxRows: HUB_SUBTASK_PAGE_SIZE,
   });
-  return enriched.map((row, idx) => mapAdminTaskRow(row, idx)).filter(Boolean);
+  return enriched.map((row, idx) => mapAdminSubtaskRow(row, idx)).filter(Boolean);
 }
 
-function buildTaskProcessPaths(kfInstance) {
-  return buildPmProcessApiPaths(kfInstance, TASKS_ENTITY);
+function buildSubtaskProcessPaths(kfInstance) {
+  return buildPmProcessApiPaths(kfInstance, SUBTASKS_ENTITY);
 }
 
 function appQuery(paths) {
@@ -125,11 +122,11 @@ function activitiesWithWork(activities) {
   );
 }
 
-export async function fetchMyItemsStatusCounts(kfInstance) {
+export async function fetchMySubtaskItemsStatusCounts(kfInstance) {
   const cached = readCache('statusCounts');
   if (cached) return cached;
 
-  const paths = buildTaskProcessPaths(kfInstance);
+  const paths = buildSubtaskProcessPaths(kfInstance);
   if (!paths?.statusCountPath) return null;
   try {
     const response = await fetchKfJson(kfInstance, paths.statusCountPath);
@@ -144,58 +141,40 @@ export async function fetchMyItemsStatusCounts(kfInstance) {
     writeCache('statusCounts', counts);
     return counts;
   } catch (e) {
-    console.warn('UserHub: status count fetch failed', e?.message || e);
+    console.warn('UserHub subtasks: status count fetch failed', e?.message || e);
     return null;
   }
 }
 
-export async function fetchMyCreatedTasksByStatus(
+export async function fetchMyCreatedSubtasksByStatus(
   kfInstance,
   statusLabel,
-  { page = 1, pageSize = HUB_TASK_PAGE_SIZE } = {},
+  { page = 1, pageSize = HUB_SUBTASK_PAGE_SIZE } = {},
 ) {
-  const paths = buildTaskProcessPaths(kfInstance);
+  const paths = buildSubtaskProcessPaths(kfInstance);
   if (!paths) return { rows: [], total: 0, page, pageSize };
 
   const segment = STATUS_TO_SEGMENT[statusLabel] || 'draft';
   const pn = Math.max(1, Number(page) || 1);
-  const ps = Math.min(1000, Math.max(1, Number(pageSize) || HUB_TASK_PAGE_SIZE));
+  const ps = Math.min(1000, Math.max(1, Number(pageSize) || HUB_SUBTASK_PAGE_SIZE));
   const path =
     `/process/2/${paths.accountId}/${paths.processId}/myitems/${segment}` +
     `?apply_preference=true&page_number=${pn}&page_size=${ps}&${appQuery(paths)}`;
 
   const response = await fetchKfJson(kfInstance, path);
-  const rows = await mapRowsWithRevisionDetail(kfInstance, extractListPayload(response));
+  const rows = await mapRawSubtaskRows(kfInstance, extractListPayload(response));
   const total = extractAggregationTotal(response, rows.length);
   return { rows, total, page: pn, pageSize: ps };
 }
 
-export async function fetchMyCreatedProcessTasks(kfInstance) {
-  const pages = await Promise.all(
-    MYITEMS_STATUS_OPTIONS.map((label) =>
-      fetchMyCreatedTasksByStatus(kfInstance, label, { page: 1, pageSize: HUB_TASK_PAGE_SIZE }),
-    ),
-  );
-  const merge = [];
-  pages.forEach(({ rows }) => merge.push(...(rows || [])));
-  const seen = new Set();
-  return merge.filter((row) => {
-    const id = String(row?.InstanceID ?? row?.id ?? '').trim();
-    if (!id) return true;
-    if (seen.has(id)) return false;
-    seen.add(id);
-    return true;
-  });
-}
-
-export function resolveTaskDraftDeleteId(row) {
+export function resolveSubtaskDraftDeleteId(row) {
   return String(
     row?.InstanceID ?? row?.raw?._id ?? row?._id ?? row?.id ?? '',
   ).trim();
 }
 
-export async function deleteTaskDraftRecords(kfInstance, recordIds) {
-  const paths = buildTaskProcessPaths(kfInstance);
+export async function deleteSubtaskDraftRecords(kfInstance, recordIds) {
+  const paths = buildSubtaskProcessPaths(kfInstance);
   if (!paths || !kfInstance) return { successIds: [], failed: recordIds.length };
   const ids = (Array.isArray(recordIds) ? recordIds : []).map((id) => String(id || '').trim()).filter(Boolean);
   if (!ids.length) return { successIds: [], failed: 0 };
@@ -223,16 +202,16 @@ export async function deleteTaskDraftRecords(kfInstance, recordIds) {
     if (r.status === 'fulfilled') successIds.push(ids[idx]);
     else failed += 1;
   });
-  invalidateHubTaskCaches();
+  invalidateHubSubtaskCaches();
   return { successIds, failed };
 }
 
-export async function fetchPendingTaskActivities(kfInstance, { force = false } = {}) {
+export async function fetchPendingSubtaskActivities(kfInstance, { force = false } = {}) {
   if (!force) {
     const cached = readCache('pending');
     if (cached) return cached;
   }
-  const paths = buildTaskProcessPaths(kfInstance);
+  const paths = buildSubtaskProcessPaths(kfInstance);
   if (!paths?.pendingCountPath) return [];
   const response = await fetchKfJson(kfInstance, paths.pendingCountPath);
   const list = Array.isArray(response) ? response : extractListPayload(response);
@@ -241,17 +220,17 @@ export async function fetchPendingTaskActivities(kfInstance, { force = false } =
   return activities;
 }
 
-export async function fetchAssignedOpenProcessTasks(
+export async function fetchAssignedOpenProcessSubtasks(
   kfInstance,
-  { page = 1, pageSize = HUB_TASK_PAGE_SIZE, activities: preloaded } = {},
+  { page = 1, pageSize = HUB_SUBTASK_PAGE_SIZE, activities: preloaded } = {},
 ) {
-  const paths = buildTaskProcessPaths(kfInstance);
+  const paths = buildSubtaskProcessPaths(kfInstance);
   if (!paths) return { rows: [], total: 0, page, pageSize };
 
-  const activities = preloaded || (await fetchPendingTaskActivities(kfInstance));
+  const activities = preloaded || (await fetchPendingSubtaskActivities(kfInstance));
   const total = sumActivityCounts(activities);
   const pn = Math.max(1, Number(page) || 1);
-  const ps = Math.min(1000, Math.max(1, Number(pageSize) || HUB_TASK_PAGE_SIZE));
+  const ps = Math.min(1000, Math.max(1, Number(pageSize) || HUB_SUBTASK_PAGE_SIZE));
   const work = activitiesWithWork(activities);
 
   const batches = await runWithConcurrency(work, ACTIVITY_LIST_CONCURRENCY, async (activity) => {
@@ -260,15 +239,20 @@ export async function fetchAssignedOpenProcessTasks(
     return extractListPayload(response);
   });
 
-  return { rows: await mapRowsWithRevisionDetail(kfInstance, batches.flat()), total, page: pn, pageSize: ps };
+  return {
+    rows: await mapRawSubtaskRows(kfInstance, batches.flat()),
+    total,
+    page: pn,
+    pageSize: ps,
+  };
 }
 
-export async function fetchParticipatedTaskActivities(kfInstance, { force = false } = {}) {
+export async function fetchParticipatedSubtaskActivities(kfInstance, { force = false } = {}) {
   if (!force) {
     const cached = readCache('participated');
     if (cached) return cached;
   }
-  const paths = buildTaskProcessPaths(kfInstance);
+  const paths = buildSubtaskProcessPaths(kfInstance);
   if (!paths) return [];
   const appQ = appQuery(paths);
   const path = `/process/2/${paths.accountId}/${paths.processId}/participated/activity/count${appQ ? `?${appQ}` : ''}`;
@@ -278,17 +262,17 @@ export async function fetchParticipatedTaskActivities(kfInstance, { force = fals
   return steps;
 }
 
-export async function fetchAssignedClosedProcessTasks(
+export async function fetchAssignedClosedProcessSubtasks(
   kfInstance,
-  { page = 1, pageSize = HUB_TASK_PAGE_SIZE, activities: preloaded } = {},
+  { page = 1, pageSize = HUB_SUBTASK_PAGE_SIZE, activities: preloaded } = {},
 ) {
-  const paths = buildTaskProcessPaths(kfInstance);
+  const paths = buildSubtaskProcessPaths(kfInstance);
   if (!paths) return { rows: [], total: 0, page, pageSize };
 
-  const steps = preloaded || (await fetchParticipatedTaskActivities(kfInstance));
+  const steps = preloaded || (await fetchParticipatedSubtaskActivities(kfInstance));
   const total = sumActivityCounts(steps);
   const pn = Math.max(1, Number(page) || 1);
-  const ps = Math.min(1000, Math.max(1, Number(pageSize) || HUB_TASK_PAGE_SIZE));
+  const ps = Math.min(1000, Math.max(1, Number(pageSize) || HUB_SUBTASK_PAGE_SIZE));
   const appQ = appQuery(paths);
   const work = activitiesWithWork(steps);
 
@@ -300,31 +284,20 @@ export async function fetchAssignedClosedProcessTasks(
     return extractListPayload(response);
   });
 
-  return { rows: await mapRowsWithRevisionDetail(kfInstance, batches.flat()), total, page: pn, pageSize: ps };
+  return {
+    rows: await mapRawSubtaskRows(kfInstance, batches.flat()),
+    total,
+    page: pn,
+    pageSize: ps,
+  };
 }
 
-export async function fetchAllAssignedProcessTasks(kfInstance) {
-  const [open, closed] = await Promise.all([
-    fetchAssignedOpenProcessTasks(kfInstance, { page: 1, pageSize: HUB_TASK_PAGE_SIZE }),
-    fetchAssignedClosedProcessTasks(kfInstance, { page: 1, pageSize: HUB_TASK_PAGE_SIZE }),
-  ]);
-  const seen = new Set();
-  const out = [];
-  for (const row of [...(open.rows || []), ...(closed.rows || [])]) {
-    const id = String(row?.InstanceID ?? row?.id ?? row?.raw?._id ?? '').trim();
-    if (id && seen.has(id)) continue;
-    if (id) seen.add(id);
-    out.push(row);
-  }
-  return out;
-}
-
-export async function fetchUserHubTaskCounts(kfInstance) {
+export async function fetchUserHubSubtaskCounts(kfInstance) {
   try {
     const [statusCounts, pendingActs, participatedActs] = await Promise.all([
-      fetchMyItemsStatusCounts(kfInstance),
-      fetchPendingTaskActivities(kfInstance),
-      fetchParticipatedTaskActivities(kfInstance),
+      fetchMySubtaskItemsStatusCounts(kfInstance),
+      fetchPendingSubtaskActivities(kfInstance),
+      fetchParticipatedSubtaskActivities(kfInstance),
     ]);
     const created = statusCounts
       ? Object.values(statusCounts).reduce((sum, n) => sum + (Number(n) || 0), 0)
@@ -349,7 +322,7 @@ export async function fetchUserHubTaskCounts(kfInstance) {
   }
 }
 
-export function unwrapTaskPageResult(result) {
+export function unwrapSubtaskPageResult(result) {
   if (Array.isArray(result)) return { rows: result, total: result.length };
   if (result && Array.isArray(result.rows)) {
     return {

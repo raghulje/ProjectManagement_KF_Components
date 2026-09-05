@@ -17,10 +17,29 @@ const PLUS_SIZE = 36
 const PILL_H_GAP = 10
 const PILL_TRANSLATE_X = PLUS_SIZE + PILL_H_GAP
 
-/** Attach fan offsets / delays for 1–3+ options. */
-export function withFanLayout(baseOptions = []) {
+/** Attach fan offsets / delays for 1–3+ options. `direction`: center | down | up */
+export function withFanLayout(baseOptions = [], direction = 'center') {
   const n = baseOptions.length
   if (n === 0) return []
+
+  if (direction === 'down') {
+    return baseOptions.map((o, i) => ({
+      ...o,
+      offsetY: i * PILL_STEP,
+      delayOpen: `${i * 45}ms`,
+      delayClose: `${(n - 1 - i) * 40}ms`,
+    }))
+  }
+
+  if (direction === 'up') {
+    return baseOptions.map((o, i) => ({
+      ...o,
+      offsetY: -i * PILL_STEP,
+      delayOpen: `${i * 45}ms`,
+      delayClose: `${(n - 1 - i) * 40}ms`,
+    }))
+  }
+
   if (n === 1) {
     return [{ ...baseOptions[0], offsetY: 0, delayOpen: '0ms', delayClose: '0ms' }]
   }
@@ -42,18 +61,32 @@ export function withFanLayout(baseOptions = []) {
   })
 }
 
-function fanMetrics(optionCount) {
+function fanMetrics(optionCount, direction = 'center') {
   const spread =
     optionCount <= 1
       ? 0
-      : optionCount === 2
+      : direction === 'center' && optionCount === 2
         ? PILL_STEP
         : PILL_STEP * (optionCount - 1)
-  const fanHeight = spread + PILL_HEIGHT + 16
   const fanWidth = PILL_TRANSLATE_X + PILL_WIDTH + 8
+
+  if (direction === 'down') {
+    const pillAnchorTop = (PLUS_SIZE - PILL_HEIGHT) / 2
+    const fanHeight = Math.max(PLUS_SIZE, pillAnchorTop + spread + PILL_HEIGHT) + 8
+    return { fanWidth, fanHeight, plusTop: 0, pillAnchorTop, fanAlign: 'top' }
+  }
+
+  if (direction === 'up') {
+    const fanHeight = Math.max(PLUS_SIZE, spread + PILL_HEIGHT) + 8
+    const plusTop = fanHeight - PLUS_SIZE
+    const pillAnchorTop = plusTop + (PLUS_SIZE - PILL_HEIGHT) / 2
+    return { fanWidth, fanHeight, plusTop, pillAnchorTop, fanAlign: 'bottom' }
+  }
+
+  const fanHeight = spread + PILL_HEIGHT + 16
   const plusTop = (fanHeight - PLUS_SIZE) / 2
   const pillAnchorTop = fanHeight / 2 - PILL_HEIGHT / 2
-  return { fanWidth, fanHeight, plusTop, pillAnchorTop }
+  return { fanWidth, fanHeight, plusTop, pillAnchorTop, fanAlign: 'center' }
 }
 
 function PlusIcon({ open }) {
@@ -140,6 +173,12 @@ export default function SatelliteOrbitMenu({
   onCreated = null,
   options = DEFAULT_SATELLITE_OPTIONS,
   placement = 'inline',
+  /**
+   * How pills spread vs the + hub.
+   * `down` — use in sticky/top headers so Project isn't clipped by the viewport.
+   * `center` — classic mid-page fan. `up` — bottom-docked FABs.
+   */
+  fanDirection = 'center',
   /** Per-option popup ids, e.g. `{ task: 'Popup_QO1ppGoYU6' }` */
   popupIds = null,
 }) {
@@ -148,10 +187,13 @@ export default function SatelliteOrbitMenu({
   const [busyKey, setBusyKey] = useState(null)
   const [error, setError] = useState('')
 
-  const fanActions = useMemo(() => withFanLayout(options), [options])
-  const { fanWidth, fanHeight, plusTop, pillAnchorTop } = useMemo(
-    () => fanMetrics(fanActions.length),
-    [fanActions.length],
+  const fanActions = useMemo(
+    () => withFanLayout(options, fanDirection),
+    [options, fanDirection],
+  )
+  const { fanWidth, fanHeight, plusTop, pillAnchorTop, fanAlign } = useMemo(
+    () => fanMetrics(fanActions.length, fanDirection),
+    [fanActions.length, fanDirection],
   )
 
   const clearCloseTimer = useCallback(() => {
@@ -228,7 +270,13 @@ export default function SatelliteOrbitMenu({
       onMouseLeave={scheduleClose}
     >
       <div
-        className="absolute right-0 top-1/2 -translate-y-1/2"
+        className={
+          fanAlign === 'top'
+            ? 'absolute right-0 top-0'
+            : fanAlign === 'bottom'
+              ? 'absolute right-0 bottom-0'
+              : 'absolute right-0 top-1/2 -translate-y-1/2'
+        }
         style={{
           width: `${fanWidth}px`,
           height: `${fanHeight}px`,

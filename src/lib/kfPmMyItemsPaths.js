@@ -74,6 +74,11 @@ export function buildPmProcessApiPaths(kf, entity) {
       const ps = Math.min(100000, Math.max(1, Number(pageSize) || 1000))
       return `/process/2/${accountId}/admin/${processId}/item?page_number=${pn}&page_size=${ps}&apply_preference=1`
     },
+    /** Single admin item — Entity / Functions / Task_type / Table::Task_History (dev + prod). */
+    getAdminItemDetailPath(instanceId) {
+      const id = encodeURIComponent(String(instanceId || '').trim())
+      return `/process/2/${accountId}/admin/${processId}/${id}?${appQ}`
+    },
     getInstancePath(instanceId, activityInstanceId) {
       const id = encodeURIComponent(String(instanceId))
       if (activityInstanceId) {

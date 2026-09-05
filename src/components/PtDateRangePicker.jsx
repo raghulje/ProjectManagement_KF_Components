@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { attachMenuWheelGuard, isScrollEventInsideEl } from '../lib/portalMenuGuards.js';
+import { attachMenuWheelGuard, isScrollEventInsideEl, PORTAL_MENU_Z_INDEX } from '../lib/portalMenuGuards.js';
 
 const WEEKDAYS = ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'];
 const PANEL_W = 268;
@@ -8,7 +8,7 @@ const PANEL_W = 268;
 const PANEL_EST_H = 340;
 
 const DEFAULT_TRIGGER =
-  'relative inline-flex h-8 min-h-[2rem] w-full min-w-[8.5rem] items-center justify-between gap-2 rounded-lg border border-slate-200/90 bg-white px-2.5 pr-7 text-left text-xs font-medium text-slate-700 shadow-none outline-none transition hover:border-slate-300 hover:bg-slate-50 cursor-pointer';
+  'relative inline-flex h-8 min-h-[2rem] w-full min-w-0 items-center justify-between gap-2 rounded-lg border border-slate-200/90 bg-white px-2.5 pr-7 text-left text-xs font-medium text-slate-700 shadow-none outline-none transition hover:border-slate-300 hover:bg-slate-50 cursor-pointer';
 
 function startOfMonth(date) {
   return new Date(date.getFullYear(), date.getMonth(), 1);
@@ -101,7 +101,7 @@ export default function PtDateRangePicker({
       bottom: preferUp ? window.innerHeight - rect.top + 4 : undefined,
       // Only clamp when the viewport is shorter than a full month panel.
       ...(available < PANEL_EST_H ? { maxHeight: Math.max(260, available) } : {}),
-      zIndex: 9999,
+      zIndex: PORTAL_MENU_Z_INDEX,
     };
   }, []);
 
@@ -185,7 +185,7 @@ export default function PtDateRangePicker({
     : placeholder;
 
   return (
-    <div ref={rootRef} className={`relative inline-flex min-w-0 shrink-0 ${className}`}>
+    <div ref={rootRef} className={`relative inline-flex min-w-0 w-full max-w-full ${className}`}>
       <i
         className="ri-calendar-line pointer-events-none absolute left-2.5 top-1/2 z-[1] -translate-y-1/2 text-sm text-[#1E88E5]"
         aria-hidden

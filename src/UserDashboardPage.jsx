@@ -1,6 +1,11 @@
 /**
- * User dashboard — same ProjectDashboardPage UI (insights, health monitors, tables),
- * scoped with Me / My Team toggle (My Team uses the same reports as UserSpecificPT).
+ * User dashboard — same ProjectDashboardPage UI (insights, health monitors,
+ * tables with column header filters/sort, period picker, etc.).
+ *
+ * User mode via scopeToCurrentUser:
+ * - Me → assignee/owner slice of the full portfolio
+ * - My Team → manager reports My_Team_A05 / My_Team_A04 with the same L1/L2
+ *   client scoping as UserSpecificPT
  */
 import ProjectDashboardPage from './ProjectDashboardPage.jsx';
 

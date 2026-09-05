@@ -187,23 +187,81 @@ function DetailSectionCard({ title, icon, accent = 'blue', children }) {
   );
 }
 
+function formatTaskIdRef(value) {
+  if (value == null || value === '') return '—';
+  if (typeof value === 'object' && !Array.isArray(value)) {
+    const name = displayFieldValue(value.Sub_Task_Name || value.Sub_task_Name);
+    const businessId = displayFieldValue(value.Subtaxk_id);
+    if (name && name !== '—' && businessId && businessId !== '—') return `${name} (${businessId})`;
+    if (name && name !== '—') return name;
+    if (businessId && businessId !== '—') return businessId;
+    return displayFieldValue(value.Name) || '—';
+  }
+  return displayFieldValue(value) || '—';
+}
+
+function formatUserRef(value) {
+  if (Array.isArray(value)) {
+    const names = value.map((v) => displayFieldValue(v)).filter((n) => n && n !== '—');
+    return names.length ? names.join(', ') : '—';
+  }
+  return displayFieldValue(value) || '—';
+}
+
+function formatDateTimeValue(value) {
+  if (value == null || value === '') return '—';
+  const s = String(value).trim();
+  if (!s) return '—';
+  // Prefer date-only display for ISO datetimes / YYYY-MM-DD
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) {
+    const d = new Date(s);
+    if (!Number.isNaN(d.getTime())) {
+      return d.toLocaleDateString('en-US', { month: 'numeric', day: 'numeric', year: 'numeric' });
+    }
+    return s.slice(0, 10);
+  }
+  return s;
+}
+
+/** My Team subtask popup — Name, created, assignee, parent, dates, summary, status, priority. */
 function resolveSubtaskFormFields(row) {
-  const r = row?.raw ?? {};
-  const summary =
-    displayFieldValue(row?.summary) ||
-    displayFieldValue(r?.SubTask_Summary) ||
-    displayFieldValue(row?.taskName) ||
+  const r = row?.raw ?? row ?? {};
+  const taskIdRef = r?.Task_ID ?? null;
+  const parentName =
+    (taskIdRef && typeof taskIdRef === 'object'
+      ? displayFieldValue(taskIdRef.Sub_Task_Name || taskIdRef.Sub_task_Name)
+      : '') || '—';
+  const parentId =
+    (taskIdRef && typeof taskIdRef === 'object'
+      ? displayFieldValue(taskIdRef.Subtaxk_id)
+      : '') ||
+    displayFieldValue(r?.Task_ID_Hidden) ||
     '—';
-  const assignedTo =
-    displayFieldValue(row?.assignedTo) ||
-    displayFieldValue(r?.Assignee_1) ||
-    '—';
-  const createdBy =
-    displayFieldValue(row?.createdBy) ||
-    displayFieldValue(r?._created_by) ||
-    '—';
-  const status = displayFieldValue(row?.status || r?._status) || '—';
-  return { summary, assignedTo, createdBy, status };
+
+  return {
+    name:
+      displayFieldValue(r?.Name) ||
+      displayFieldValue(r?.Sub_task_Name) ||
+      displayFieldValue(row?.taskName) ||
+      '—',
+    createdAt: formatDateTimeValue(r?._created_at),
+    currentAssignedTo: formatUserRef(r?._current_assigned_to) || formatUserRef(r?.Assignee_1) || '—',
+    parentTaskName: parentName,
+    parentTaskId: parentId,
+    parentTaskDisplay: formatTaskIdRef(taskIdRef),
+    startDate: formatDateTimeValue(r?.Start_Date || row?.startDate),
+    endDate: formatDateTimeValue(r?.End_Date || row?.endDate),
+    summary:
+      displayFieldValue(r?.SubTask_Summary) ||
+      displayFieldValue(row?.summary) ||
+      '—',
+    status: displayFieldValue(r?.TStatus) || displayFieldValue(row?.status) || '—',
+    priority:
+      displayFieldValue(r?.Sub_task_Priority) ||
+      displayFieldValue(r?.Sub_Task_Priority) ||
+      displayFieldValue(row?.priority) ||
+      '—',
+  };
 }
 
 function TaskDetailFormView({ row, viewerName = 'User', isSubtask = false }) {
@@ -213,37 +271,64 @@ function TaskDetailFormView({ row, viewerName = 'User', isSubtask = false }) {
       <div className="space-y-3 sm:space-y-3.5">
         <div className="flex flex-wrap items-start justify-between gap-2.5 rounded-2xl border border-slate-200/70 bg-white px-3.5 py-3 shadow-sm sm:px-4">
           <div className="min-w-0">
-            <p className="text-[10px] font-medium uppercase tracking-[0.14em] text-slate-400">Subtask details</p>
+            <p className="text-[10px] font-medium uppercase tracking-[0.14em] text-slate-400">
+              Subtask details
+            </p>
             <h2 id="dash-detail-title" className="mt-0.5 text-lg font-semibold tracking-tight text-slate-800 sm:text-xl">
-              {f.summary !== '—' ? f.summary : 'Subtask'}
+              {f.name !== '—' ? f.name : 'Subtask'}
             </h2>
+            {f.parentTaskDisplay !== '—' ? (
+              <p className="mt-0.5 text-xs text-slate-500 sm:text-sm">
+                Parent · {f.parentTaskDisplay}
+              </p>
+            ) : null}
           </div>
-          <StatusBadge status={f.status} />
+          <div className="flex flex-wrap items-center gap-1.5">
+            <StatusBadge status={f.status} />
+            {f.priority !== '—' ? (
+              <span className="inline-flex items-center rounded-lg bg-blue-50 px-2 py-0.5 text-[11px] font-medium text-[#1E88E5]">
+                {f.priority}
+              </span>
+            ) : null}
+          </div>
         </div>
 
         <DetailSectionCard title="Details" icon="ri-node-tree" accent="blue">
-          <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
-            <DetailTile label="Summary" className="sm:col-span-3">
-              <DetailValue>{f.summary}</DetailValue>
-            </DetailTile>
-            <DetailTile label="Assignee">
-              <div className="flex items-center gap-1.5">
-                <div className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-[#1E88E5] text-[9px] font-bold text-white">
-                  {toInitials(f.assignedTo)}
-                </div>
-                <DetailValue>{f.assignedTo}</DetailValue>
-              </div>
-            </DetailTile>
-            <DetailTile label="Created by">
-              <div className="flex items-center gap-1.5">
-                <div className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-slate-500 text-[9px] font-bold text-white">
-                  {toInitials(f.createdBy)}
-                </div>
-                <DetailValue>{f.createdBy}</DetailValue>
-              </div>
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
+            <DetailTile label="Name" className="sm:col-span-2">
+              <DetailValue>{f.name}</DetailValue>
             </DetailTile>
             <DetailTile label="Status">
               <StatusBadge status={f.status} />
+            </DetailTile>
+            <DetailTile label="Priority">
+              <DetailValue>{f.priority}</DetailValue>
+            </DetailTile>
+            <DetailTile label="Assigned to">
+              <div className="flex items-center gap-1.5">
+                <div className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-[#1E88E5] text-[9px] font-bold text-white">
+                  {toInitials(f.currentAssignedTo)}
+                </div>
+                <DetailValue>{f.currentAssignedTo}</DetailValue>
+              </div>
+            </DetailTile>
+            <DetailTile label="Created">
+              <DetailValue>{f.createdAt}</DetailValue>
+            </DetailTile>
+            <DetailTile label="Parent task" className="sm:col-span-2">
+              <DetailValue>{f.parentTaskName}</DetailValue>
+            </DetailTile>
+            <DetailTile label="Parent task ID">
+              <DetailValue className="font-mono text-[12px] sm:text-[13px]">{f.parentTaskId}</DetailValue>
+            </DetailTile>
+            <DetailTile label="Start date">
+              <DetailValue>{f.startDate}</DetailValue>
+            </DetailTile>
+            <DetailTile label="End date">
+              <DetailValue>{f.endDate}</DetailValue>
+            </DetailTile>
+            <DetailTile label="Sub-Task Summary" className="sm:col-span-2 lg:col-span-3">
+              <DetailValue className="whitespace-pre-wrap">{f.summary}</DetailValue>
             </DetailTile>
           </div>
         </DetailSectionCard>
@@ -256,6 +341,10 @@ function TaskDetailFormView({ row, viewerName = 'User', isSubtask = false }) {
   const docNames = (f.documents || [])
     .map((d) => displayFieldValue(d?.Name || d?.name || d?.filename || d?.FileName || d) || '')
     .filter(Boolean);
+  const revisionHistory = Array.isArray(row?.revisionHistory) ? row.revisionHistory : [];
+  const hasRevision = Boolean(row?.hasRevision && row?.revisedEndDate);
+  const revisionEntries = hasRevision ? revisionHistory.slice(1) : [];
+  const revisedCount = Number(row?.revisedCount) || revisionEntries.length;
 
   return (
     <div className="space-y-3 sm:space-y-3.5">
@@ -325,13 +414,22 @@ function TaskDetailFormView({ row, viewerName = 'User', isSubtask = false }) {
       </DetailSectionCard>
 
       <DetailSectionCard title="Schedule" icon="ri-calendar-schedule-line" accent="blue">
-        <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+        <div className={`grid grid-cols-1 gap-2 sm:grid-cols-2 ${hasRevision ? 'lg:grid-cols-4' : 'lg:grid-cols-3'}`}>
           <DetailTile label="Start date">
             <DetailValue>{f.startDate}</DetailValue>
           </DetailTile>
-          <DetailTile label="End date" highlight={f.status === 'Overdue' || Number(row?.delayDays) > 0}>
-            <DetailValue highlight={f.status === 'Overdue' || Number(row?.delayDays) > 0}>{f.endDate}</DetailValue>
+          <DetailTile label={hasRevision ? 'Previous end date' : 'End date'} highlight={!hasRevision && (f.status === 'Overdue' || Number(row?.delayDays) > 0)}>
+            <DetailValue highlight={!hasRevision && (f.status === 'Overdue' || Number(row?.delayDays) > 0)}>
+              {hasRevision
+                ? (row?.previousEndDate || row?.originalEndDate || f.endDate)
+                : f.endDate}
+            </DetailValue>
           </DetailTile>
+          {hasRevision ? (
+            <DetailTile label="Latest revised end date" highlight>
+              <DetailValue highlight>{row.revisedEndDate}</DetailValue>
+            </DetailTile>
+          ) : null}
           <DetailTile label="Delay" highlight={Number(row?.delayDays) > 0}>
             <DetailValue highlight={Number(row?.delayDays) > 0}>
               {Number(row?.delayDays) > 0 ? `+${row.delayDays} days` : 'On time'}
@@ -366,6 +464,41 @@ function TaskDetailFormView({ row, viewerName = 'User', isSubtask = false }) {
           )}
         </DetailSectionCard>
       </div>
+
+      {revisionEntries.length > 0 ? (
+        <DetailSectionCard
+          title={`Revision history (${revisedCount})`}
+          icon="ri-history-line"
+          accent="rose"
+        >
+          <div className="space-y-1.5">
+            {revisionEntries.map((rev, idx) => (
+              <div
+                key={rev.key || `${rev.date}-${idx}`}
+                className="rounded-lg border border-slate-200/90 bg-white px-2.5 py-2 shadow-[0_1px_2px_rgba(15,23,42,0.04)]"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <p className="text-[12px] text-slate-600">
+                    Updated on: <span className="font-medium text-slate-800">{rev.date || '—'}</span>
+                  </p>
+                  <p className="text-[11px] text-slate-500">{rev.revisedBy || 'System'}</p>
+                </div>
+                <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[12px] text-slate-600">
+                  <p>
+                    Previous end date:{' '}
+                    <span className="font-medium text-slate-500 line-through">{rev.previousEndDate || '—'}</span>
+                  </p>
+                  <i className="ri-arrow-right-line text-[11px] text-[#FB8C00]" aria-hidden />
+                  <p>
+                    Updated end date:{' '}
+                    <span className="font-semibold text-[#FB8C00]">{rev.newEndDate || '—'}</span>
+                  </p>
+                </div>
+              </div>
+            ))}
+          </div>
+        </DetailSectionCard>
+      ) : null}
     </div>
   );
 }

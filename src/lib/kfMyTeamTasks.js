@@ -191,10 +191,12 @@ export function mapMyTeamTaskRow(row, columns) {
   const status = toText(read('Task_Status')) || '—';
   const priority = toText(read('Task_Priority')) || 'Medium';
   const start = fmtDate(parseKfDate(read('Start_Date'))) || '—';
-  const end =
-    fmtDate(parseKfDate(read('Actual_End_Date_1'))) ||
-    fmtDate(parseKfDate(read('End_Date'))) ||
-    '—';
+  const plannedEnd = fmtDate(parseKfDate(read('End_Date'))) || '';
+  const actualEnd = fmtDate(parseKfDate(read('Actual_End_Date_1'))) || '';
+  const end = actualEnd || plannedEnd || '—';
+  // Case report has no revision timeline; differing planned vs actual end ≈ 1 revision.
+  const hasRevision = Boolean(actualEnd && plannedEnd && actualEnd !== plannedEnd);
+  const revisedCount = hasRevision ? 1 : 0;
 
   return {
     id: taskBusinessId,
@@ -210,6 +212,10 @@ export function mapMyTeamTaskRow(row, columns) {
     initials: toInitials(assigneeRef.name),
     start,
     end,
+    originalEndDate: plannedEnd || null,
+    revisedEndDate: hasRevision ? actualEnd : null,
+    revisedCount,
+    hasRevision,
     agingDays: Number.isFinite(agingDays) ? agingDays : 0,
     delayDays,
     delay: delayDays > 0 ? `+${delayDays}d` : 'On time',
@@ -303,17 +309,9 @@ export function mapMyTeamTasksResponse(response, options = {}) {
   const byProject = allowedProjectIds ? filterTasksByAllowedProjects(tasks, allowedProjectIds) : [];
 
   if (hasManagerFields || allowedProjectIds) {
-    // Union: keep email-matched tasks AND tasks on manager projects (many rows lack L1/L2).
-    const merged = dedupeTasksById([...byEmail, ...byProject]);
-    if (merged.length > 0) {
-      tasks = merged;
-    } else if (!trustApiScope) {
-      tasks = [];
-    } else {
-      console.warn(
-        `My Team tasks: ${tasks.length} API row(s) but 0 after scope filter for ${loggedInEmail}; keeping API-scoped rows`,
-      );
-    }
+    // Union: L1/L2 email matches AND tasks on already-filtered manager projects.
+    // Never keep the unscoped API payload when both filters yield nothing.
+    tasks = dedupeTasksById([...byEmail, ...byProject]);
   } else if (!trustApiScope) {
     tasks = [];
   }

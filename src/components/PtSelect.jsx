@@ -4,6 +4,7 @@ import {
   attachMenuWheelGuard,
   isScrollEventInsideEl,
   scrollChildIntoList,
+  PORTAL_MENU_Z_INDEX,
 } from '../lib/portalMenuGuards.js';
 
 /**
@@ -88,7 +89,7 @@ export default function PtSelect({
       top: preferUp ? undefined : Math.min(viewportH - maxH - 8, Math.max(8, rect.bottom + 6)),
       bottom: preferUp ? Math.min(viewportH - 8, Math.max(8, viewportH - rect.top + 6)) : undefined,
       maxHeight: Math.max(120, maxH),
-      zIndex: 9999,
+      zIndex: PORTAL_MENU_Z_INDEX,
     });
   }, []);
 

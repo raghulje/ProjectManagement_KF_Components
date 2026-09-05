@@ -220,7 +220,17 @@ function mapIndividualTaskRow(row, columns) {
 
 function mapSubtaskRow(row) {
   const parentTaskBusinessId = resolveSubtaskParentTaskId(row);
+  const named = String(
+    row?.Sub_task_Name || row?.Sub_Task_Name || row?.Subtask_Name || '',
+  ).trim();
   const summary = String(row?.SubTask_Summary || '').trim();
+  const systemName = String(row?.Name || '').trim();
+  const isProcessLabel = /^sub[-\s]?task process from\b/i.test(systemName);
+  const displayName =
+    named ||
+    summary ||
+    (!isProcessLabel && systemName && !/^Pk[A-Za-z0-9]+$/.test(systemName) ? systemName : '') ||
+    'Untitled subtask';
   const assigneeName = String(row?.Assignee_1?.Name || '').trim();
   const createdByName = String(row?._created_by?.Name || '').trim();
   const assigneePerson = userToPerson(row?.Assignee_1);
@@ -229,9 +239,10 @@ function mapSubtaskRow(row) {
     id: row._id,
     type: 'subtask',
     parentTaskBusinessId,
-    /** Prefer SubTask_Summary — Kissflow Name is usually "Sub-Task Process from …". */
-    name: summary || 'Untitled subtask',
-    summary: summary || null,
+    /** Prefer Sub_task_Name (form), then SubTask_Summary — Name is often a process label. */
+    name: displayName,
+    summary: summary || named || null,
+    subtaskName: displayName,
     assigneeName: assigneeName || '—',
     createdBy: createdByName || '—',
     meta: [assigneeName && `Assignee ${assigneeName}`, createdByName && `Created by ${createdByName}`]

@@ -22,8 +22,8 @@ export default function UserHubProjectsPage({ useLayout = false }) {
   );
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-[#edf1ff] via-[#f6f8ff] to-[#f2ecff]">
-      <div className="mx-auto max-w-[1800px] p-2 pb-6 sm:p-6">
+    <div className="min-h-screen overflow-x-clip bg-gradient-to-b from-[#edf1ff] via-[#f6f8ff] to-[#f2ecff]">
+      <div className="mx-auto min-w-0 max-w-[1800px] p-3 pb-6 sm:p-6">
         <ProjectDashboardPage
           useLayout={useLayout}
           scopeToCurrentUser

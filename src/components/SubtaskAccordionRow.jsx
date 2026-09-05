@@ -1,18 +1,14 @@
 /**
  * Shared nested-subtask row for task accordions across dashboards.
- * Shows SubTask_Summary + Assignee_1 + Created by (never Kissflow Name / Pk id).
+ * Prefer Sub_task_Name (form title), then SubTask_Summary; never raw process Name.
  */
 
+import PtUserAvatar from './PtUserAvatar.jsx';
+import { resolveSubtaskDisplayName } from '../lib/kfSubtaskTracker.js';
+
 export function formatSubtaskDisplayFields(sub) {
+  const summary = resolveSubtaskDisplayName(sub, '');
   const raw = sub?.raw && typeof sub.raw === 'object' ? sub.raw : {};
-  const summary = String(
-    sub?.summary ||
-      raw?.SubTask_Summary ||
-      sub?.taskName ||
-      sub?.name ||
-      sub?.subtaskName ||
-      '',
-  ).trim();
   const assignee = String(
     sub?.assignedTo ||
       sub?.assigneeName ||
@@ -47,21 +43,39 @@ export default function SubtaskAccordionRow({
     <button
       type="button"
       onClick={onClick}
-      className={`flex w-full cursor-pointer items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white text-left transition hover:bg-slate-50 ${
-        compact ? 'px-2.5 py-2' : 'px-3 py-2.5'
+      className={`flex w-full cursor-pointer items-center justify-between gap-2 border border-slate-200/80 bg-white text-left shadow-none transition hover:bg-slate-50 ${
+        compact ? 'rounded-lg px-2 py-1.5' : 'gap-3 rounded-xl px-3 py-2.5'
       } ${className}`}
     >
       <div className="flex min-w-0 items-center gap-2">
-        <i className={`ri-node-tree shrink-0 text-[#FB8C00] ${compact ? 'text-sm' : 'text-sm'}`} aria-hidden />
+        <i className={`ri-node-tree shrink-0 text-[#FB8C00] ${compact ? 'text-xs' : 'text-sm'}`} aria-hidden />
         <div className="min-w-0">
-          <p className={`truncate font-medium text-[#2C3E50] ${compact ? 'text-[11px]' : 'text-[12px] sm:text-sm'}`}>
+          <p className={`truncate font-medium text-[#2C3E50] ${compact ? 'text-[11px] leading-snug' : 'text-[12px] sm:text-sm'}`}>
             {summary}
           </p>
-          <p className={`truncate text-[#7F8C8D] ${compact ? 'text-[10px]' : 'text-[10px] sm:text-xs'}`}>
-            Assignee {assignee}
-            <span className="text-slate-300"> · </span>
-            Created by {createdBy}
-          </p>
+          <div
+            className={`mt-0.5 flex flex-wrap items-center gap-1.5 text-[#7F8C8D] ${
+              compact ? 'text-[9px]' : 'text-[10px] sm:text-xs'
+            }`}
+          >
+            <span className="inline-flex min-w-0 items-center gap-1">
+              <span className="shrink-0">Assignee</span>
+              <PtUserAvatar
+                name={assignee}
+                sizeClass={compact ? 'h-4 w-4' : 'h-5 w-5'}
+                textClass={compact ? 'text-[8px]' : 'text-[9px]'}
+              />
+            </span>
+            {!compact ? (
+              <>
+                <span className="text-slate-300">·</span>
+                <span className="inline-flex items-center gap-1">
+                  <span>Created by</span>
+                  <PtUserAvatar name={createdBy} sizeClass="h-5 w-5" textClass="text-[9px]" />
+                </span>
+              </>
+            ) : null}
+          </div>
         </div>
       </div>
       {statusSlot}
