@@ -61,6 +61,8 @@ export function resolveSubtaskDisplayName(source, fallback = 'Untitled subtask')
     raw.Subtask_Name,
     row.subtaskName,
     row.taskName,
+    // mapSubtaskRow / hub rows often expose the title as `name` only
+    row.name,
   );
   if (named) return named;
 
@@ -273,13 +275,14 @@ function activityInstanceIdOfSubtask(row) {
   return String(raw || '').trim();
 }
 
-/** Pending/myitems list rows often omit Task_ID, TStatus, Sub_task_Priority. */
+/** Pending/myitems list rows often omit Task_ID, TStatus, Sub_task_Priority, Sub_task_Name. */
 export function rawSubtaskRowNeedsDetailEnrichment(row) {
   if (!row || typeof row !== 'object') return false;
   const hasTaskId = Boolean(row.Task_ID || row.Task_ID_Hidden);
   const hasTStatus = Boolean(String(row.TStatus || '').trim());
   const hasPriority = Boolean(String(row.Sub_task_Priority || row.Sub_Task_Priority || '').trim());
-  return !hasTaskId || !hasTStatus || !hasPriority;
+  const hasTitle = Boolean(resolveSubtaskDisplayName(row, ''));
+  return !hasTaskId || !hasTStatus || !hasPriority || !hasTitle;
 }
 
 /**

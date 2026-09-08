@@ -21,8 +21,8 @@ import AdminTasks from './AdminTasks.jsx'
 function App() {
   return (
     <div className="rootDiv">
-      {/* <ProjectDashboardPage /> */}
-      <UserDashboardProject />
+      <ProjectDashboardPage />
+      {/* <UserDashboardProject /> */}
       {/* <UserSpecificPT /> */}
       {/* <AdminTasks /> */}
       {/* <ReportsProject /> */}

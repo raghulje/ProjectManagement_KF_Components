@@ -2,12 +2,14 @@ import { kfGetJson, kfMutateJson, resolveKissflowAccountId, KF_ADMIN_PAGE_SIZE, 
 import { fetchMyIndividualTasks } from './kfProjectTrackerKarthika.js';
 import { buildPmProcessApiPaths } from './kfPmMyItemsPaths.js';
 import { TASKS_ENTITY } from './pmMyItemsEntities.js';
+import { resolveSubtaskDisplayName } from './kfSubtaskTracker.js';
 
 const DEFAULT_ACCOUNT_ID = 'AcCMptp3yqcn';
 const TASK_PROCESS_ID = 'Project_Sub_Task_A01';
 const TASK_REPORT_PATH = `/process-report/2/{acc}/${TASK_PROCESS_ID}/Live_Sub_Task_Task_Wise_A00`;
 const INDIVIDUAL_TASK_REPORT_PATH = `/process-report/2/{acc}/${TASK_PROCESS_ID}/My_Individual_Tasks_A00`;
 const TASK_DETAIL_CONCURRENCY = 8;
+const TASK_LIST_MAX_PAGES = 200;
 
 function extractApiRows(payload) {
   if (!payload) return [];
@@ -436,24 +438,12 @@ export async function fetchTaskAdminItemDetail(kfInstance, instanceId) {
 
 export function mapProcessSubtaskItem(item) {
   const raw = item?.raw && typeof item.raw === 'object' ? item.raw : null;
-  const named = String(
-    raw?.Sub_task_Name ||
-      raw?.Sub_Task_Name ||
-      raw?.Subtask_Name ||
-      item?.subtaskName ||
-      item?.name ||
-      '',
-  ).trim();
+  const source = raw ? { ...item, raw } : item;
+  const displayName = resolveSubtaskDisplayName(source, 'Untitled subtask');
   const summary = String(item?.summary || raw?.SubTask_Summary || '').trim();
-  const systemName = String(raw?.Name || '').trim();
-  const isProcessLabel = /^sub[-\s]?task process from\b/i.test(systemName);
-  const displayName =
-    named ||
-    summary ||
-    (!isProcessLabel && systemName && !/^Pk[A-Za-z0-9]+$/.test(systemName) ? systemName : '') ||
-    'Untitled subtask';
   const assigneeName = String(
     item?.assigneeName ||
+      item?.assignedTo ||
       item?.people?.[0]?.name ||
       raw?.Assignee_1?.Name ||
       '',
@@ -467,13 +457,14 @@ export function mapProcessSubtaskItem(item) {
     parentTaskBusinessId: item.parentTaskBusinessId,
     taskName: displayName,
     subtaskName: displayName,
-    summary: summary || named || '—',
+    name: displayName,
+    summary: summary || (displayName !== 'Untitled subtask' ? displayName : '—'),
     assignedTo: assigneeName,
     createdBy,
     assigneeAvatar: item?.people?.[0]?.l || toInitials(assigneeName !== '—' ? assigneeName : createdBy),
     status: item.status || '—',
     startDate: '—',
-    endDate: item.due || '—',
+    endDate: raw?.End_Date || item.due || '—',
     agingDays: 0,
     delayDays: 0,
     _id: item.id,
@@ -771,6 +762,7 @@ export function mapAdminTaskRow(r, idx = 0) {
     hasRevision: revision.hasRevision,
     revisionHistory: revision.revisionHistory,
     createdAt,
+    closedAt: fmtDate(parseKfDate(r?._completed_at || r?.Actual_End_Date_1)),
     agingDays: Number.isFinite(agingDays) ? agingDays : 0,
     delayDays: Number.isFinite(delayDays) ? delayDays : 0,
     status,
@@ -876,39 +868,77 @@ function mapKarthikaTaskItem(item, idx) {
   return mapAdminTaskRow(raw, idx);
 }
 
+function taskListRowKey(row) {
+  return String(row?._id || row?._item_id || row?.Id || row?.id || '').trim();
+}
+
+function mergeTaskListBatch(merge, seen, batch) {
+  for (const item of batch) {
+    const id = taskListRowKey(item);
+    if (id) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+    }
+    merge.push(item);
+  }
+}
+
+/** Walk Kissflow list pages until a short batch — page_size 500 is not a total cap. */
+async function fetchAllPagedTaskRows(loadPage, pageSize = KF_ADMIN_PAGE_SIZE) {
+  const merge = [];
+  const seen = new Set();
+  const ps = Math.max(1, Number(pageSize) || KF_ADMIN_PAGE_SIZE);
+  for (let pageNumber = 1; pageNumber <= TASK_LIST_MAX_PAGES; pageNumber += 1) {
+    const batch = await loadPage(pageNumber, ps);
+    const rows = Array.isArray(batch) ? batch : [];
+    if (!rows.length) break;
+    const before = merge.length;
+    mergeTaskListBatch(merge, seen, rows);
+    if (merge.length === before) break;
+    if (rows.length < ps) break;
+  }
+  return merge;
+}
+
 async function fetchAdminTaskRows(kfInstance, applyPreference) {
   const accountId = resolveKissflowAccountId(kfInstance, DEFAULT_ACCOUNT_ID);
   const pref =
     applyPreference === undefined
       ? ''
       : `&apply_preference=${applyPreference ? '1' : '0'}`;
-  const path =
-    `/process/2/${accountId}/admin/${TASK_PROCESS_ID}/item?page_number=1&page_size=${KF_ADMIN_PAGE_SIZE}${pref}`;
-  const payload = await kfGetJson(kfInstance, path);
-  return extractApiRows(payload);
+  return fetchAllPagedTaskRows(async (pageNumber, pageSize) => {
+    const path =
+      `/process/2/${accountId}/admin/${TASK_PROCESS_ID}/item?page_number=${pageNumber}&page_size=${pageSize}${pref}`;
+    const payload = await kfGetJson(kfInstance, path);
+    return extractApiRows(payload);
+  });
 }
 
 async function fetchReportTaskRows(kfInstance, reportPathTemplate, extraQuery = {}) {
   if (!kfInstance?.api || !kfInstance?.account?._id) return [];
   const accId = kfInstance.account._id;
   const path = reportPathTemplate.replace('{acc}', accId);
-  const query = new URLSearchParams({
-    apply_preference: 'true',
-    page_number: '1',
-    page_size: String(KF_ADMIN_PAGE_SIZE),
-    ...extraQuery,
-  }).toString();
-  const resp = await kfInstance.api(`${path}?${query}`, { method: 'GET', headers: { Accept: 'application/json' } });
-  const payload = resp?.data ?? resp ?? null;
-  return extractApiRows(payload);
+  return fetchAllPagedTaskRows(async (pageNumber, pageSize) => {
+    const query = new URLSearchParams({
+      apply_preference: 'true',
+      page_size: String(pageSize),
+      ...extraQuery,
+      page_number: String(pageNumber),
+    }).toString();
+    const resp = await kfInstance.api(`${path}?${query}`, { method: 'GET', headers: { Accept: 'application/json' } });
+    const payload = resp?.data ?? resp ?? null;
+    return extractApiRows(payload);
+  });
 }
 
 async function fetchMyItemsTaskRows(kfInstance) {
   if (!kfInstance?.api || !kfInstance?.account?._id) return [];
   const accId = kfInstance.account._id;
-  const path = `/process/2/${accId}/${TASK_PROCESS_ID}/myitems/all?apply_preference=true&page_number=1&page_size=${KF_ADMIN_PAGE_SIZE}&skip_aggregation=true`;
-  const payload = await kfGetJson(kfInstance, path);
-  return extractApiRows(payload);
+  return fetchAllPagedTaskRows(async (pageNumber, pageSize) => {
+    const path = `/process/2/${accId}/${TASK_PROCESS_ID}/myitems/all?apply_preference=true&page_number=${pageNumber}&page_size=${pageSize}&skip_aggregation=true`;
+    const payload = await kfGetJson(kfInstance, path);
+    return extractApiRows(payload);
+  });
 }
 
 /**

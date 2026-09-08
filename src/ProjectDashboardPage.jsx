@@ -39,8 +39,10 @@ import {
   ensureTaskBusinessIdForCreate,
   fetchTaskTrackerData,
   resolveTaskBusinessIdFromRow,
+  mapProcessSubtaskItem,
 } from './lib/kfTaskTracker.js';
 import { fetchMyTeamProjects } from './lib/kfMyTeamProjects.js';
+import { collectProjectExportRows, exportProjectAccordion } from './lib/exportProjectAccordion.js';
 import {
   fetchMyTeamTasks,
   filterTasksByManagerEmail,
@@ -501,6 +503,16 @@ function mapItemsToProjectRows(items, detailById, activityById, availableFieldId
       supportAvailable: isTruthyFlag(detail?.Suuport_Available, Array.isArray(detail?.Support_Available) && detail.Support_Available.length > 0),
       cbAnalysisAvailable: parseApiBoolean(detail?.CB_Analysis_Document_Available),
       createdAt: fmtDate(parseKfDate(detail?._created_at || item?._created_at)),
+      closedAt: fmtDate(
+        parseKfDate(
+          detail?._resolved_at ||
+            item?._resolved_at ||
+            detail?._completed_at ||
+            item?._completed_at ||
+            detail?.Actual_End_Date_1,
+        ),
+      ),
+      resolvedAt: fmtDate(parseKfDate(detail?._resolved_at || item?._resolved_at)),
       modifiedAt: fmtDate(parseKfDate(detail?._modified_at || item?._modified_at)),
       createdBy: personDisplayName(detail?._created_by || item?._created_by),
       createdById: extractPersonRef(detail?._created_by || item?._created_by, '').id,
@@ -798,14 +810,6 @@ function resolveCreatedDateRange(createdYear, createdPeriod) {
   return null;
 }
 
-function projectMatchesCreatedRange(row, range) {
-  if (!range) return true;
-  const created = parseKfDate(row?.createdAt || row?._created_at);
-  if (!created) return false;
-  const t = created.getTime();
-  return t >= range.from.getTime() && t <= range.to.getTime();
-}
-
 function parseYmdRange(fromStr, toStr) {
   const fromRaw = String(fromStr || '').trim();
   const toRaw = String(toStr || '').trim();
@@ -828,28 +832,106 @@ function resolveDimensionCreatedRanges(filters) {
   return legacy ? [legacy] : [];
 }
 
-function projectMatchesAnyCreatedRange(row, ranges) {
-  if (!Array.isArray(ranges) || ranges.length === 0) return true;
-  return ranges.some((range) => projectMatchesCreatedRange(row, range));
+function normalizePeriodCategory(value) {
+  const v = String(value || 'created').trim().toLowerCase();
+  if (v === 'closed') return 'closed';
+  if (v === 'needaction' || v === 'need_action' || v === 'action') return 'needAction';
+  return 'created';
 }
 
-function taskMatchesCreatedRange(row, range) {
-  if (!range) return true;
-  const created = parseKfDate(
-    row?.createdAt ||
-      row?.createdDate ||
-      row?._created_at ||
-      row?.raw?._created_at ||
-      row?.raw?.Created_at,
+/** "this week" / "this month" / "this quarter" / "this half" / "this FY" */
+function getPeriodCategoryScopeLabel(filters) {
+  const mode = String(filters?.periodMode || '').trim();
+  const parts = (Array.isArray(filters?.periodParts) ? filters.periodParts : []).filter(
+    (p) => p && p !== 'FULL',
   );
-  if (!created) return false;
-  const t = created.getTime();
-  return t >= range.from.getTime() && t <= range.to.getTime();
+  if (mode === 'weekly') return 'this week';
+  if (mode === 'monthly') return 'this month';
+  if (mode === 'fy') {
+    if (parts.some((p) => String(p).startsWith('Q'))) return 'this quarter';
+    if (parts.some((p) => String(p).startsWith('H'))) return 'this half';
+    return 'this FY';
+  }
+  return 'this period';
 }
 
-function taskMatchesAnyCreatedRange(row, ranges) {
+function dateInAnyRange(dateLike, ranges) {
   if (!Array.isArray(ranges) || ranges.length === 0) return true;
-  return ranges.some((range) => taskMatchesCreatedRange(row, range));
+  const parsed = parseKfDate(dateLike);
+  if (!parsed) return false;
+  const t = parsed.getTime();
+  return ranges.some((range) => t >= range.from.getTime() && t <= range.to.getTime());
+}
+
+function getRowCreatedValue(row) {
+  return (
+    row?.createdAt ||
+    row?.createdDate ||
+    row?._created_at ||
+    row?.raw?._created_at ||
+    row?.raw?.Created_at ||
+    null
+  );
+}
+
+function getRowClosedValue(row) {
+  return (
+    row?.closedAt ||
+    row?.resolvedAt ||
+    row?.raw?._resolved_at ||
+    row?.raw?._completed_at ||
+    row?.raw?.Actual_End_Date_1 ||
+    (isClosedProjectStatus(row?.status)
+      ? row?.modifiedAt || row?.raw?._modified_at || row?.endDate || row?.originalEndDate
+      : null)
+  );
+}
+
+function getRowDueValue(row) {
+  return (
+    row?.raw?.End_Date ||
+    row?.raw?.End_date ||
+    row?.raw?.End_Date_1 ||
+    row?.plannedEndDate ||
+    row?.originalEndDate ||
+    row?.endDate ||
+    row?.end ||
+    row?.due ||
+    null
+  );
+}
+
+function rowIsClosed(row) {
+  return isClosedProjectStatus(row?.status);
+}
+
+/** Need action = planned End_Date falls in the selected period window. */
+function rowNeedsActionInPeriod(row, ranges) {
+  return dateInAnyRange(getRowDueValue(row), ranges);
+}
+
+function rowMatchesPeriodCategory(row, ranges, category) {
+  if (!Array.isArray(ranges) || ranges.length === 0) return true;
+  const cat = normalizePeriodCategory(category);
+  if (cat === 'closed') return rowIsClosed(row) && dateInAnyRange(getRowClosedValue(row), ranges);
+  if (cat === 'needAction') return rowNeedsActionInPeriod(row, ranges);
+  return dateInAnyRange(getRowCreatedValue(row), ranges);
+}
+
+function applyPeriodCategoryFilter(rows, filters) {
+  const ranges = resolveDimensionCreatedRanges(filters);
+  if (!ranges.length) return Array.isArray(rows) ? rows : [];
+  return (Array.isArray(rows) ? rows : []).filter((row) =>
+    rowMatchesPeriodCategory(row, ranges, filters?.periodCategory),
+  );
+}
+
+function countPeriodCategoryMatches(rows, filters, category) {
+  const ranges = resolveDimensionCreatedRanges(filters);
+  if (!ranges.length) return 0;
+  return (Array.isArray(rows) ? rows : []).filter((row) =>
+    rowMatchesPeriodCategory(row, ranges, category),
+  ).length;
 }
 
 function hasPortfolioDimensionFilters(filters) {
@@ -876,65 +958,67 @@ function isInformationTechnologyCategory(value) {
   return normalizeDimensionValue(value) === normalizeDimensionValue(IT_BUSINESS_FUNCTION);
 }
 
-function filterProjectsByDimensions(rows, filters) {
-  if (!hasActiveDimensionFilters(filters)) return rows;
-  const createdRanges = resolveDimensionCreatedRanges(filters);
-  return rows.filter((row) => {
+function filterProjectsByPortfolioDims(rows, filters) {
+  if (!hasPortfolioDimensionFilters(filters)) return Array.isArray(rows) ? rows : [];
+  return (Array.isArray(rows) ? rows : []).filter((row) => {
     if (filters.company && normalizeDimensionValue(row.companyName) !== filters.company) return false;
     if (filters.department && normalizeDimensionValue(row.department) !== filters.department) return false;
     if (filters.lineOfBusiness && normalizeDimensionValue(row.lineOfBusiness) !== filters.lineOfBusiness) return false;
     if (filters.functionType && normalizeDimensionValue(row.functionType) !== filters.functionType) return false;
-    if (!projectMatchesAnyCreatedRange(row, createdRanges)) return false;
     return true;
+  });
+}
+
+function filterProjectsByDimensions(rows, filters) {
+  if (!hasActiveDimensionFilters(filters)) return rows;
+  return applyPeriodCategoryFilter(filterProjectsByPortfolioDims(rows, filters), filters);
+}
+
+function filterTasksLinkedToProjects(tasks, projects, filters) {
+  if (!hasPortfolioDimensionFilters(filters)) return Array.isArray(tasks) ? tasks : [];
+  if (!projects.length) return [];
+  const projectIds = new Set(projects.map((p) => p.id));
+  const projectNames = new Set(projects.map((p) => p.name).filter(Boolean));
+  const projectRefs = new Set(projects.map((p) => String(p.displayId || '').trim()).filter(Boolean));
+
+  return (Array.isArray(tasks) ? tasks : []).filter((task) => {
+    if (task.projectId && projectIds.has(task.projectId)) return true;
+    if (task.projectName && projectNames.has(task.projectName)) return true;
+    const ref = String(task.projectRef || task.raw?.Project_ID_Details || '').trim();
+    if (ref && projectRefs.has(ref)) return true;
+    return false;
   });
 }
 
 function filterTasksByProjects(tasks, projects, filters) {
   if (!hasActiveDimensionFilters(filters)) return tasks;
-
-  const createdRanges = resolveDimensionCreatedRanges(filters);
-  const needsProjectLink = hasPortfolioDimensionFilters(filters);
-  let next = Array.isArray(tasks) ? tasks : [];
-
-  if (needsProjectLink) {
-    if (!projects.length) return [];
-    const projectIds = new Set(projects.map((p) => p.id));
-    const projectNames = new Set(projects.map((p) => p.name).filter(Boolean));
-    const projectRefs = new Set(projects.map((p) => String(p.displayId || '').trim()).filter(Boolean));
-
-    next = next.filter((task) => {
-      if (task.projectId && projectIds.has(task.projectId)) return true;
-      if (task.projectName && projectNames.has(task.projectName)) return true;
-      const ref = String(task.projectRef || task.raw?.Project_ID_Details || '').trim();
-      if (ref && projectRefs.has(ref)) return true;
-      return false;
-    });
-  }
-
-  if (createdRanges.length) {
-    next = next.filter((task) => taskMatchesAnyCreatedRange(task, createdRanges));
-  }
-
-  return next;
+  const linked = hasPortfolioDimensionFilters(filters)
+    ? filterTasksLinkedToProjects(tasks, projects, filters)
+    : (Array.isArray(tasks) ? tasks : []);
+  return applyPeriodCategoryFilter(linked, filters);
 }
 
 function filterProcessSubtasksByTasks(processSubtasks, tasks, filters) {
   if (!hasActiveDimensionFilters(filters)) return processSubtasks;
-  if (!tasks.length) return [];
 
-  const taskKeys = new Set();
-  for (const task of tasks) {
-    const businessId = resolveTaskBusinessIdFromRow(task);
-    if (businessId) taskKeys.add(businessId);
-    if (task.id) taskKeys.add(String(task.id));
-    if (task.taskId) taskKeys.add(String(task.taskId));
+  let next = Array.isArray(processSubtasks) ? processSubtasks : [];
+  if (hasPortfolioDimensionFilters(filters)) {
+    if (!tasks.length) return [];
+    const taskKeys = new Set();
+    for (const task of tasks) {
+      const businessId = resolveTaskBusinessIdFromRow(task);
+      if (businessId) taskKeys.add(businessId);
+      if (task.id) taskKeys.add(String(task.id));
+      if (task.taskId) taskKeys.add(String(task.taskId));
+    }
+    next = next.filter((sub) => {
+      const parentId = String(sub.parentTaskBusinessId || '').trim();
+      const subId = String(sub.id || '').trim();
+      return (parentId && taskKeys.has(parentId)) || (subId && taskKeys.has(subId));
+    });
   }
 
-  return processSubtasks.filter((sub) => {
-    const parentId = String(sub.parentTaskBusinessId || '').trim();
-    const subId = String(sub.id || '').trim();
-    return (parentId && taskKeys.has(parentId)) || (subId && taskKeys.has(subId));
-  });
+  return applyPeriodCategoryFilter(next, filters);
 }
 
 function countActiveDimensionFilters(filters) {
@@ -946,6 +1030,67 @@ function countActiveDimensionFilters(filters) {
   if (filters?.periodFrom || (Array.isArray(filters?.periodRanges) && filters.periodRanges.length > 0)) n += 1;
   if (filters?.createdYear) n += 1;
   return n;
+}
+
+function PeriodCategoryChips({
+  filters,
+  counts = null,
+  onChange,
+  compact = false,
+}) {
+  const ranges = resolveDimensionCreatedRanges(filters);
+  if (!ranges.length) return null;
+  const scope = getPeriodCategoryScopeLabel(filters);
+  const active = normalizePeriodCategory(filters?.periodCategory);
+  const items = [
+    { key: 'created', label: 'Created', icon: 'ri-add-circle-line' },
+    { key: 'closed', label: 'Closed', icon: 'ri-checkbox-circle-line' },
+    { key: 'needAction', label: 'Need action', icon: 'ri-error-warning-line' },
+  ];
+
+  return (
+    <div
+      role="tablist"
+      aria-label={`Period category ${scope}`}
+      className={`inline-flex items-stretch overflow-hidden rounded-xl border border-slate-200 bg-slate-100/80 p-0.5 ${
+        compact ? 'h-10 w-full' : 'h-9'
+      }`}
+    >
+      {items.map((item) => {
+        const selected = active === item.key;
+        const count = counts?.[item.key];
+        return (
+          <button
+            key={item.key}
+            type="button"
+            role="tab"
+            aria-selected={selected}
+            title={`${item.label} ${scope}`}
+            onClick={() => onChange?.(item.key)}
+            className={`inline-flex items-center justify-center gap-1 rounded-[0.6rem] px-2 text-[11px] font-semibold leading-none transition ${
+              compact ? 'min-h-0 flex-1' : 'min-h-0 whitespace-nowrap'
+            } ${
+              selected
+                ? item.key === 'needAction'
+                  ? 'bg-amber-50 text-amber-800 shadow-sm'
+                  : item.key === 'closed'
+                    ? 'bg-emerald-50 text-emerald-800 shadow-sm'
+                    : 'bg-white text-[#1E62F0] shadow-sm'
+                : 'text-slate-500 hover:bg-white/70 hover:text-slate-700'
+            }`}
+          >
+            <i className={`${item.icon} text-[13px]`} aria-hidden />
+            <span>{item.label}</span>
+            {Number.isFinite(count) ? (
+              <span className={`tabular-nums ${selected ? 'font-bold' : 'font-semibold text-slate-400'}`}>
+                {count}
+              </span>
+            ) : null}
+          </button>
+        );
+      })}
+    </div>
+  );
 }
 
 function DashboardDimensionFilters({
@@ -961,6 +1106,7 @@ function DashboardDimensionFilters({
   portfolioUserOptions = null,
   /** Hides Company / Business Functions / Function Type (UserHub tasks). */
   hideCompanyFunctionFilters = false,
+  periodCategoryCounts = null,
 }) {
   const [sheetOpen, setSheetOpen] = useState(false);
   const [draft, setDraft] = useState(filters);
@@ -1022,6 +1168,7 @@ function DashboardDimensionFilters({
       fyStartYear: draft?.periodFyStartYear ?? null,
       summaryLabel: draft?.periodLabel || 'All time',
     });
+    onChange('periodCategory', draft?.periodCategory || filters.periodCategory || 'created');
 
     if (typeof onPortfolioUserChange === 'function') {
       const draftUser = draft?.__portfolioUser ?? portfolioUserFilter;
@@ -1073,6 +1220,15 @@ function DashboardDimensionFilters({
       label: filters.periodLabel || 'Period',
       onRemove: () => onChange('period', getEmptyPeriodState()),
     });
+    const cat = normalizePeriodCategory(filters.periodCategory);
+    const scope = getPeriodCategoryScopeLabel(filters);
+    const catLabel =
+      cat === 'closed' ? `Closed ${scope}` : cat === 'needAction' ? `Need action ${scope}` : `Created ${scope}`;
+    chips.push({
+      key: 'periodCategory',
+      label: catLabel,
+      onRemove: () => onChange('periodCategory', 'created'),
+    });
   }
   if (portfolioUserFilter) {
     chips.push({
@@ -1091,6 +1247,14 @@ function DashboardDimensionFilters({
           <MobileFiltersButton count={activeCount} onClick={openSheet} />
         </div>
         <MobileActiveFilterChips chips={chips} />
+        {resolveDimensionCreatedRanges(filters).length > 0 ? (
+          <PeriodCategoryChips
+            compact
+            filters={filters}
+            counts={periodCategoryCounts}
+            onChange={(next) => onChange('periodCategory', next)}
+          />
+        ) : null}
       </div>
 
       {/* Desktop: original horizontal / wrap rail — unchanged */}
@@ -1131,6 +1295,19 @@ function DashboardDimensionFilters({
 
         {suffix}
 
+        {resolveDimensionCreatedRanges(filters).length > 0 ? (
+          <label className="flex shrink-0 snap-start flex-col gap-1">
+            <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+              Category · {getPeriodCategoryScopeLabel(filters)}
+            </span>
+            <PeriodCategoryChips
+              filters={filters}
+              counts={periodCategoryCounts}
+              onChange={(next) => onChange('periodCategory', next)}
+            />
+          </label>
+        ) : null}
+
         {hasActiveFilters ? (
           <button
             type="button"
@@ -1144,7 +1321,7 @@ function DashboardDimensionFilters({
 
       {hasActiveFilters ? (
         <p className="hidden text-center text-[10px] font-medium text-slate-500 lg:block lg:text-right">
-          Portfolio filters applied across all sections · dates use project created date
+          Portfolio filters applied across all sections · Period uses Created / Closed / Need action
         </p>
       ) : null}
 
@@ -1197,6 +1374,19 @@ function DashboardDimensionFilters({
             triggerClassName="rounded-xl bg-white py-2 shadow-sm text-xs min-h-[2.5rem]"
           />
         </MobileFilterField>
+        {resolveDimensionCreatedRanges(draft || filters).length > 0 ? (
+          <MobileFilterField label="Period category">
+            <PeriodCategoryChips
+              compact
+              filters={{
+                ...(draft || filters),
+                periodCategory: draft?.periodCategory || filters.periodCategory,
+              }}
+              counts={periodCategoryCounts}
+              onChange={(next) => setDraft((prev) => ({ ...prev, periodCategory: next }))}
+            />
+          </MobileFilterField>
+        ) : null}
         {Array.isArray(portfolioUserOptions) && typeof onPortfolioUserChange === 'function' ? (
           <MobileFilterField label="User">
             <PtSelect
@@ -1445,6 +1635,7 @@ function mapMyTeamProjectToDashboardRow(p) {
     companyName: '',
     department: '',
     createdAt: p.createdAt || null,
+    closedAt: p.closedAt || p.resolvedAt || null,
     l1ManagerEmail: p.l1ManagerEmail || '',
     l2ManagerEmail: p.l2ManagerEmail || '',
     raw: p.raw || p,
@@ -1476,6 +1667,7 @@ function mapMyTeamTaskToDashboardRow(t) {
     l1ManagerEmail: t.l1ManagerEmail || '',
     l2ManagerEmail: t.l2ManagerEmail || '',
     createdAt: t.createdAt || null,
+    closedAt: t.closedAt || t.raw?._completed_at || t.raw?.Actual_End_Date_1 || null,
     raw: t.raw || t,
   };
 }
@@ -2298,43 +2490,6 @@ function resolveProjectBusinessId(project) {
   return displayId || String(project?.id ?? '').trim();
 }
 
-function mapProcessSubtaskItem(item) {
-  const raw = item?.raw && typeof item.raw === 'object' ? item.raw : null;
-  const summary = String(
-    item?.summary || raw?.SubTask_Summary || item?.name || '',
-  ).trim();
-  const assigneeName = String(
-    item?.assigneeName ||
-      item?.people?.[0]?.name ||
-      raw?.Assignee_1?.Name ||
-      '',
-  ).trim() || '—';
-  const createdBy = String(
-    item?.createdBy || raw?._created_by?.Name || '',
-  ).trim() || '—';
-  const displayName = summary || 'Untitled subtask';
-
-  return {
-    id: item.id,
-    parentTaskBusinessId: item.parentTaskBusinessId,
-    taskName: displayName,
-    summary: summary || '—',
-    assignedTo: assigneeName,
-    createdBy,
-    assigneeAvatar: item?.people?.[0]?.l || toInitials(assigneeName !== '—' ? assigneeName : createdBy),
-    status: item.status || '—',
-    startDate: '—',
-    endDate: item.due || '—',
-    agingDays: 0,
-    delayDays: 0,
-    _id: item.id,
-    _activity_instance_id: item.activityInstanceId,
-    InstanceID: item.id,
-    ActivityID: item.activityInstanceId,
-    raw: raw || item,
-  };
-}
-
 function formatProjectRef(displayId, rowId) {
   const raw = String(displayId ?? rowId ?? '').trim();
   if (!raw) return 'Task-NA';
@@ -2867,7 +3022,7 @@ function ProjectHealthTable({ data, allTasks, allProcessSubtasks, onOpenTaskPopu
                     {open ? (
                       <tr className="bg-slate-50/95">
                         <td colSpan={8} className="border-b border-slate-200 p-0 align-top">
-                          <div className="max-h-[min(70vh,36rem)] overflow-y-auto border-t border-slate-200/80">
+                          <div className="border-t border-slate-200/80">
                             <ProjectDrillDownPanel
                               project={row}
                               allTasks={allTasks}
@@ -4239,52 +4394,55 @@ function SubtaskTable({
           </div>
         )}
 
-        <div className="flex w-full flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center lg:ml-auto lg:w-auto">
-          <div className={`relative w-full ${compact ? 'sm:w-48' : 'sm:w-40'}`}>
-            <i className="ri-search-line absolute left-2.5 top-1/2 -translate-y-1/2 text-sm text-[#7F8C8D]" />
-            <input
-              type="text"
-              placeholder="Search task..."
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              className={`min-h-[40px] w-full rounded-xl border border-slate-200 bg-white py-2 pl-8 pr-3 outline-none focus:border-indigo-500 lg:rounded-2xl ${compact ? 'text-[11px]' : 'text-[11px]'} sm:text-xs`}
-            />
-          </div>
-
-          <div className="flex w-full gap-2 lg:hidden">
-            <MobileFiltersButton count={taskFilterCount} onClick={openTaskFilterSheet} />
-            {typeof onRefresh === 'function' ? (
-              <button
-                type="button"
-                aria-label="Refresh tasks"
-                disabled={refreshing}
-                onClick={() => onRefresh()}
-                className="inline-flex min-h-[40px] shrink-0 items-center justify-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 text-[11px] font-semibold text-[#2C3E50]"
-              >
-                <i className={`ri-refresh-line text-sm ${refreshing ? 'animate-spin' : ''}`} aria-hidden />
-                {refreshing ? '…' : 'Refresh'}
-              </button>
-            ) : null}
+        <div className="flex w-full min-w-0 flex-col gap-2 lg:ml-auto lg:w-auto lg:flex-row lg:items-center lg:gap-2">
+          <div className="flex min-w-0 items-center gap-2">
+            <div className={`relative min-w-0 flex-1 ${compact ? 'lg:w-40' : 'lg:w-44'} lg:flex-none`}>
+              <i className="ri-search-line absolute left-2.5 top-1/2 -translate-y-1/2 text-sm text-[#7F8C8D]" />
+              <input
+                type="text"
+                placeholder="Search task..."
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                className={`h-9 w-full rounded-xl border border-slate-200 bg-white py-0 pl-8 pr-3 text-[11px] outline-none focus:border-indigo-500 sm:text-xs ${compact ? '' : 'lg:rounded-2xl'}`}
+              />
+            </div>
+            <div className="flex shrink-0 gap-2 lg:hidden">
+              <MobileFiltersButton count={taskFilterCount} onClick={openTaskFilterSheet} />
+              {typeof onRefresh === 'function' ? (
+                <button
+                  type="button"
+                  aria-label="Refresh tasks"
+                  title="Refresh tasks"
+                  disabled={refreshing}
+                  onClick={() => onRefresh()}
+                  className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-slate-200 bg-white text-[#2C3E50]"
+                >
+                  <i className={`ri-refresh-line text-sm ${refreshing ? 'animate-spin' : ''}`} aria-hidden />
+                </button>
+              ) : null}
+            </div>
           </div>
           <div className="lg:hidden">
             <MobileActiveFilterChips chips={taskChips} />
           </div>
-          {headerActions ? <div className="w-full lg:hidden">{headerActions}</div> : null}
+          {headerActions ? <div className="flex w-full items-start lg:hidden">{headerActions}</div> : null}
 
-          <div className="hidden snap-x snap-mandatory items-center gap-2 overflow-x-auto pb-1 [-ms-overflow-style:none] [scrollbar-width:none] sm:flex-wrap sm:overflow-visible sm:pb-0 lg:flex [&::-webkit-scrollbar]:hidden">
+          <div className="hidden shrink-0 items-center gap-1.5 lg:flex">
             <PtSelect
               value={statusFilter}
               onChange={(e) => setStatusFilter(e.target.value)}
-              className="min-w-[8rem] shrink-0"
+              className="w-[7.75rem] shrink-0"
               aria-label="Filter by status"
+              triggerClassName="h-9 min-h-9 py-0 text-xs"
               options={statusOptions}
             />
             {!hideProjectFilter ? (
             <PtSelect
               value={projectFilter}
               onChange={(e) => setProjectFilter(e.target.value)}
-              className="min-w-[8rem] max-w-[180px] shrink-0"
+              className="w-[8.5rem] max-w-[180px] shrink-0"
               aria-label="Filter by project"
+              triggerClassName="h-9 min-h-9 py-0 text-xs"
               options={projectOptions}
             />
             ) : null}
@@ -4292,12 +4450,15 @@ function SubtaskTable({
               <button
                 type="button"
                 aria-label="Refresh tasks"
+                title="Refresh tasks"
                 disabled={refreshing}
                 onClick={() => onRefresh()}
-                className="shrink-0 snap-start inline-flex items-center gap-1.5 rounded-2xl border border-slate-200 bg-white px-2.5 py-2 text-[11px] font-semibold text-[#2C3E50] shadow-sm transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60 sm:px-3 sm:text-xs"
+                className={`inline-flex h-9 shrink-0 items-center justify-center rounded-xl border border-slate-200 bg-white text-[11px] font-semibold text-[#2C3E50] shadow-sm transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60 ${
+                  compact ? 'w-9' : 'gap-1.5 px-2.5'
+                }`}
               >
                 <i className={`ri-refresh-line text-sm ${refreshing ? 'animate-spin' : ''}`} aria-hidden />
-                {refreshing ? 'Refreshing…' : 'Refresh'}
+                {compact ? null : refreshing ? 'Refreshing…' : 'Refresh'}
               </button>
             ) : null}
             {headerActions}
@@ -5063,14 +5224,101 @@ function ProjectDrillDownPanel({
 }) {
   const [activeTab, setActiveTab] = useState('subtasks');
   const [creatingTask, setCreatingTask] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const exportMenuRef = useRef(null);
 
   useEffect(() => {
     setActiveTab('subtasks');
+    setExportOpen(false);
   }, [project?.id]);
+
+  useEffect(() => {
+    if (!exportOpen) return undefined;
+    const onPointerDown = (event) => {
+      if (exportMenuRef.current && !exportMenuRef.current.contains(event.target)) {
+        setExportOpen(false);
+      }
+    };
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') setExportOpen(false);
+    };
+    document.addEventListener('pointerdown', onPointerDown);
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [exportOpen]);
 
   const rows = Array.isArray(allTasks) ? allTasks : [];
   const linkedTasks = getTasksLinkedToProject(project, rows);
   const canCreateTask = typeof onCreateTaskPopup === 'function' && !isProjectClosed(project?.status);
+
+  const handleExport = useCallback(
+    async (kind) => {
+      if (exporting) return;
+      setExporting(true);
+      setExportOpen(false);
+      try {
+        const bundle = collectProjectExportRows(
+          project,
+          linkedTasks,
+          allProcessSubtasks,
+          filterSubtasksForTask,
+          resolveTaskBusinessIdFromRow,
+        );
+        await exportProjectAccordion(kind, bundle);
+      } catch (error) {
+        console.warn('Project accordion export failed:', error);
+      } finally {
+        setExporting(false);
+      }
+    },
+    [allProcessSubtasks, exporting, linkedTasks, project],
+  );
+
+  const exportButton = (
+    <div ref={exportMenuRef} className="relative w-full min-w-0 lg:w-auto">
+      <button
+        type="button"
+        disabled={exporting}
+        aria-expanded={exportOpen}
+        aria-haspopup="menu"
+        onClick={() => setExportOpen((open) => !open)}
+        className="inline-flex h-9 w-full shrink-0 items-center justify-center gap-1.5 rounded-xl border border-slate-200 bg-white px-2.5 text-[11px] font-semibold text-[#2C3E50] shadow-sm transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60 lg:w-auto"
+      >
+        <i className={`ri-download-2-line ${exporting ? 'animate-pulse' : ''}`} aria-hidden />
+        {exporting ? 'Exporting…' : 'Export'}
+        <i className={`ri-arrow-down-s-line text-sm transition-transform ${exportOpen ? 'rotate-180' : ''}`} aria-hidden />
+      </button>
+      {exportOpen ? (
+        <div
+          role="menu"
+          className="z-[80] mt-1 w-full overflow-hidden rounded-xl border border-slate-200 bg-white py-1 shadow-lg lg:absolute lg:right-0 lg:w-auto lg:min-w-[12.5rem]"
+        >
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => handleExport('png')}
+            className="flex w-full items-center gap-2.5 px-3 py-2.5 text-left text-xs font-semibold text-slate-700 hover:bg-slate-50 lg:py-2 lg:text-[11px]"
+          >
+            <i className="ri-image-line text-base text-[#1E88E5]" aria-hidden />
+            PNG image
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => handleExport('csv')}
+            className="flex w-full items-center gap-2.5 px-3 py-2.5 text-left text-xs font-semibold text-slate-700 hover:bg-slate-50 lg:py-2 lg:text-[11px]"
+          >
+            <i className="ri-file-excel-2-line text-base text-[#43A047]" aria-hidden />
+            Excel (CSV)
+          </button>
+        </div>
+      ) : null}
+    </div>
+  );
 
   if (!project) return null;
 
@@ -5124,7 +5372,7 @@ function ProjectDrillDownPanel({
         ))}
       </div>
 
-      <div className="min-h-0 flex-1 p-3 sm:p-6 lg:overflow-y-auto">
+      <div className="p-3 sm:p-6">
         {activeTab === 'subtasks' && (
           <div className="space-y-3">
             <SubtaskTable
@@ -5141,25 +5389,28 @@ function ProjectDrillDownPanel({
               refreshing={refreshingTasks}
               countLabel={(n) => `${n} task${n === 1 ? '' : 's'} assigned to this project`}
               headerActions={
-                canCreateTask ? (
-                <button
-                  type="button"
-                  disabled={creatingTask}
-                  onClick={async () => {
-                    if (creatingTask || typeof onCreateTaskPopup !== 'function') return;
-                    setCreatingTask(true);
-                    try {
-                      await onCreateTaskPopup(project);
-                    } finally {
-                      setCreatingTask(false);
-                    }
-                  }}
-                  className="inline-flex w-full min-h-[40px] shrink-0 items-center justify-center gap-2 rounded-xl bg-[#1E88E5] px-3 py-2 text-[11px] font-semibold text-white shadow-sm transition hover:opacity-95 disabled:cursor-not-allowed disabled:opacity-60 sm:w-auto sm:rounded-2xl sm:text-xs lg:w-auto"
-                >
-                  <i className="ri-add-line" aria-hidden />
-                  {creatingTask ? 'Creating…' : 'Create task'}
-                </button>
-                ) : null
+                <div className="flex w-full items-start gap-1.5 lg:w-auto lg:shrink-0 lg:items-center">
+                  {exportButton}
+                  {canCreateTask ? (
+                    <button
+                      type="button"
+                      disabled={creatingTask}
+                      onClick={async () => {
+                        if (creatingTask || typeof onCreateTaskPopup !== 'function') return;
+                        setCreatingTask(true);
+                        try {
+                          await onCreateTaskPopup(project);
+                        } finally {
+                          setCreatingTask(false);
+                        }
+                      }}
+                      className="inline-flex h-9 shrink-0 items-center justify-center gap-1.5 self-start rounded-xl bg-[#1E88E5] px-2.5 text-[11px] font-semibold text-white shadow-sm transition hover:opacity-95 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      <i className="ri-add-line" aria-hidden />
+                      {creatingTask ? 'Creating…' : 'Create task'}
+                    </button>
+                  ) : null}
+                </div>
               }
             />
           </div>
@@ -5333,6 +5584,7 @@ function DashboardPagePremium({
       periodRanges: [],
       periodParts: [],
       periodFyStartYear: null,
+      periodCategory: 'created',
       createdYear: '',
       createdPeriod: '',
     };
@@ -5823,10 +6075,15 @@ function DashboardPagePremium({
     [scopedPortfolio.projects],
   );
 
-  /** Apply company / function / year first — User options and User filter hang off this set. */
-  const dimensionFilteredProjects = useMemo(
-    () => filterProjectsByDimensions(scopedPortfolio.projects, dimensionFilters),
+  /** Company / function first — period categories hang off this set so Closed/Need action stay visible. */
+  const companyFilteredProjects = useMemo(
+    () => filterProjectsByPortfolioDims(scopedPortfolio.projects, dimensionFilters),
     [scopedPortfolio.projects, dimensionFilters],
+  );
+
+  const dimensionFilteredProjects = useMemo(
+    () => applyPeriodCategoryFilter(companyFilteredProjects, dimensionFilters),
+    [companyFilteredProjects, dimensionFilters],
   );
 
   const effectiveTaskRows = useMemo(() => {
@@ -5834,14 +6091,35 @@ function DashboardPagePremium({
     return scopedPortfolio.tasks;
   }, [overrideTasks, scopedPortfolio.tasks]);
 
-  const dimensionFilteredTasks = useMemo(
-    () => filterTasksByProjects(effectiveTaskRows, dimensionFilteredProjects, dimensionFilters),
-    [effectiveTaskRows, dimensionFilteredProjects, dimensionFilters],
+  const companyFilteredTasks = useMemo(
+    () => filterTasksLinkedToProjects(effectiveTaskRows, companyFilteredProjects, dimensionFilters),
+    [effectiveTaskRows, companyFilteredProjects, dimensionFilters],
   );
 
+  const dimensionFilteredTasks = useMemo(
+    () => applyPeriodCategoryFilter(companyFilteredTasks, dimensionFilters),
+    [companyFilteredTasks, dimensionFilters],
+  );
+
+  const periodCategoryCounts = useMemo(() => {
+    if (!resolveDimensionCreatedRanges(dimensionFilters).length) return null;
+    const projectRows = companyFilteredProjects;
+    const taskRows = companyFilteredTasks;
+    const countFor = (category) => {
+      const projects = countPeriodCategoryMatches(projectRows, dimensionFilters, category);
+      const tasks = countPeriodCategoryMatches(taskRows, dimensionFilters, category);
+      return contentView === 'tasks' ? tasks : projects;
+    };
+    return {
+      created: countFor('created'),
+      closed: countFor('closed'),
+      needAction: countFor('needAction'),
+    };
+  }, [companyFilteredProjects, companyFilteredTasks, dimensionFilters, contentView]);
+
   const dimensionFilteredProcessSubtasks = useMemo(
-    () => filterProcessSubtasksByTasks(scopedPortfolio.processSubtasks, dimensionFilteredTasks, dimensionFilters),
-    [scopedPortfolio.processSubtasks, dimensionFilteredTasks, dimensionFilters],
+    () => filterProcessSubtasksByTasks(scopedPortfolio.processSubtasks, companyFilteredTasks, dimensionFilters),
+    [scopedPortfolio.processSubtasks, companyFilteredTasks, dimensionFilters],
   );
 
   /** Owners + assignees only from dimension-filtered projects/tasks. */
@@ -5889,17 +6167,19 @@ function DashboardPagePremium({
   }, [overrideTasksForMetrics, effectiveTaskRows]);
 
   const filteredMetricsSubtaskData = useMemo(() => {
-    const byDimension = filterTasksByProjects(
+    const linked = filterTasksLinkedToProjects(
       effectiveMetricsTaskRows,
-      dimensionFilteredProjects,
+      companyFilteredProjects,
       dimensionFilters,
     );
+    const byDimension = applyPeriodCategoryFilter(linked, dimensionFilters);
     if (!showPortfolioUserFilter || !portfolioUserFilter) return byDimension;
     const member = portfolioUsers.find((m) => m.name === portfolioUserFilter);
     if (!member) return byDimension;
     return filterPortfolioByUser(dimensionFilteredProjects, byDimension, [], member).tasks;
   }, [
     effectiveMetricsTaskRows,
+    companyFilteredProjects,
     dimensionFilteredProjects,
     dimensionFilters,
     showPortfolioUserFilter,
@@ -5990,6 +6270,7 @@ function DashboardPagePremium({
           // Clear legacy year/period selects when using the adaptive picker.
           createdYear: '',
           createdPeriod: '',
+          periodCategory: prev.periodCategory || 'created',
         };
       }
       const next = { ...prev, [key]: value };
@@ -6018,6 +6299,7 @@ function DashboardPagePremium({
       periodRanges: [],
       periodParts: [],
       periodFyStartYear: null,
+      periodCategory: 'created',
       createdYear: '',
       createdPeriod: '',
     });
@@ -6056,6 +6338,7 @@ function DashboardPagePremium({
     onPortfolioUserChange: showPortfolioUserFilter ? setPortfolioUserFilter : null,
     portfolioUserOptions: portfolioUserSelectOptions,
     hideCompanyFunctionFilters,
+    periodCategoryCounts,
   };
 
   const totalProjects = filteredProjectData.length;

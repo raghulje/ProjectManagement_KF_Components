@@ -37,6 +37,9 @@ const EMPTY_STATUS_COUNTS = {
   Rejected: 0,
 };
 
+/** Stable default — `selectedMembers = []` would reset table page every render. */
+const EMPTY_SELECTED_MEMBERS = [];
+
 function resolveSubtaskCreatedRanges(periodFrom, periodTo, periodRanges) {
   if (Array.isArray(periodRanges) && periodRanges.length > 0) {
     return periodRanges
@@ -94,7 +97,7 @@ export default function UserHubSubTasksPage({
   myTeamMode = false,
   myTeamRows = null,
   myTeamLoading = false,
-  selectedMembers = [],
+  selectedMembers = EMPTY_SELECTED_MEMBERS,
   /** Optional row opener (e.g. My Team custom detail modal). */
   onOpenRow = null,
   /** Override Kissflow popup id for open/create (ActivityID + InstanceID). */
@@ -206,9 +209,19 @@ export default function UserHubSubTasksPage({
     setTablePage(1);
   }, [taskScope, createdStatusFilter, assignedStatus, myTeamMode]);
 
+  const selectedMembersKey = useMemo(
+    () => (Array.isArray(selectedMembers) ? selectedMembers.map(String).join('\0') : ''),
+    [selectedMembers],
+  );
+  const periodRangesKey = useMemo(
+    () => JSON.stringify(Array.isArray(periodRanges) ? periodRanges : []),
+    [periodRanges],
+  );
+  const myTeamRowsLen = Array.isArray(myTeamRows) ? myTeamRows.length : -1;
+
   useEffect(() => {
     setTablePage(1);
-  }, [search, selectedMembers, myTeamRows, periodFrom, periodTo, periodRanges, periodMode]);
+  }, [search, selectedMembersKey, myTeamRowsLen, periodFrom, periodTo, periodRangesKey, periodMode]);
 
   const handleTaskScopeChange = useCallback((scope) => {
     setTaskScope(scope);
@@ -300,6 +313,10 @@ export default function UserHubSubTasksPage({
     const start = (safeTablePage - 1) * PT_TABLE_PAGE_SIZE;
     return filteredRows.slice(start, start + PT_TABLE_PAGE_SIZE);
   }, [filteredRows, safeTablePage]);
+
+  useEffect(() => {
+    if (tablePage > tableTotalPages) setTablePage(tableTotalPages);
+  }, [tablePage, tableTotalPages]);
 
   const draftPageRowIds = useMemo(() => {
     if (!showDraftBulkSelect) return [];

@@ -1,5 +1,9 @@
 import { kf as globalKf } from '@/sdk/index.js';
 import { kfMutateJson, KF_ADMIN_PAGE_SIZE } from './kfRuntime.js';
+import {
+  enrichRawSubtaskRowsWithInstanceDetail,
+  resolveSubtaskDisplayName,
+} from './kfSubtaskTracker.js';
 
 const PROJECTS_PATH =
   '/case-report/2/{acc}/Project_Management_A01/Your_Projects_A00';
@@ -220,17 +224,8 @@ function mapIndividualTaskRow(row, columns) {
 
 function mapSubtaskRow(row) {
   const parentTaskBusinessId = resolveSubtaskParentTaskId(row);
-  const named = String(
-    row?.Sub_task_Name || row?.Sub_Task_Name || row?.Subtask_Name || '',
-  ).trim();
+  const displayName = resolveSubtaskDisplayName(row, 'Untitled subtask');
   const summary = String(row?.SubTask_Summary || '').trim();
-  const systemName = String(row?.Name || '').trim();
-  const isProcessLabel = /^sub[-\s]?task process from\b/i.test(systemName);
-  const displayName =
-    named ||
-    summary ||
-    (!isProcessLabel && systemName && !/^Pk[A-Za-z0-9]+$/.test(systemName) ? systemName : '') ||
-    'Untitled subtask';
   const assigneeName = String(row?.Assignee_1?.Name || '').trim();
   const createdByName = String(row?._created_by?.Name || '').trim();
   const assigneePerson = userToPerson(row?.Assignee_1);
@@ -241,7 +236,7 @@ function mapSubtaskRow(row) {
     parentTaskBusinessId,
     /** Prefer Sub_task_Name (form), then SubTask_Summary — Name is often a process label. */
     name: displayName,
-    summary: summary || named || null,
+    summary: summary || (displayName !== 'Untitled subtask' ? displayName : null),
     subtaskName: displayName,
     assigneeName: assigneeName || '—',
     createdBy: createdByName || '—',
@@ -364,6 +359,22 @@ export async function fetchProjectTasks(projectId, kfInstance) {
   };
 }
 
+/** Copy column-Id values onto FieldId keys so Sub_task_Name etc. are readable. */
+function flattenProcessRowByColumns(row, columns) {
+  if (!row || typeof row !== 'object') return row;
+  if (!Array.isArray(columns) || columns.length === 0) return row;
+  const out = { ...row };
+  for (const col of columns) {
+    const fieldId = String(col?.FieldId || '').trim();
+    const colId = String(col?.Id || '').trim();
+    if (!fieldId || !colId || fieldId === colId) continue;
+    if (out[fieldId] == null && row[colId] != null) {
+      out[fieldId] = row[colId];
+    }
+  }
+  return out;
+}
+
 export async function fetchAllSubtasks(kfInstance) {
   const kf = resolveKf(kfInstance);
   const accId = kf.account._id;
@@ -374,9 +385,18 @@ export async function fetchAllSubtasks(kfInstance) {
     apply_preference: '1',
   }).toString();
   const response = await kf.api(`${path}?${query}`, { method: 'GET' });
+  const columns = Array.isArray(response?.Columns) ? response.Columns : [];
+  const data = (Array.isArray(response?.Data) ? response.Data : []).map((row) =>
+    flattenProcessRowByColumns(row, columns),
+  );
+  // Admin list often omits Sub_task_Name; merge instance detail so accordion titles match.
+  const enriched = await enrichRawSubtaskRowsWithInstanceDetail(kfInstance, data, {
+    maxRows: 150,
+    concurrency: 8,
+  });
 
   return {
-    items: (response?.Data || []).map((row) => mapSubtaskRow(row)),
+    items: enriched.map((row) => mapSubtaskRow(row)),
     raw: response,
   };
 }
