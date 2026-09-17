@@ -8,7 +8,7 @@
 import { getApiBase } from '../apiBase.js';
 import { buildPmProcessApiPaths } from './kfPmMyItemsPaths.js';
 import { TASKS_ENTITY } from './pmMyItemsEntities.js';
-import { mapAdminTaskRow, enrichRawTaskRowsWithInstanceDetail } from './kfTaskTracker.js';
+import { enrichRawTaskRowsWithInstanceDetail, mapAdminTaskRow } from './kfTaskTracker.js';
 import { runWithConcurrency } from './kfRuntime.js';
 
 export const HUB_TASK_PAGE_SIZE = 50;
@@ -95,7 +95,7 @@ function dedupeRawRows(rows) {
 
 async function mapRowsWithRevisionDetail(kfInstance, rows) {
   const unique = dedupeRawRows(rows);
-  // Pull Table::Task_History via instance/activity + access keys (same as Postman).
+  // myitems/pending lists omit Project_ID.Project_Name and Table::Task_History.
   const enriched = await enrichRawTaskRowsWithInstanceDetail(kfInstance, unique, {
     maxRows: HUB_TASK_PAGE_SIZE,
   });

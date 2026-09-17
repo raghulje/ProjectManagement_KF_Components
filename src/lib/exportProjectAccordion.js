@@ -257,36 +257,206 @@ function drawProgress(ctx, x, y, w, pct) {
   if (value > 0) fillRoundRect(ctx, x, y, Math.max(8, (w * value) / 100), 8, 4, '#1E88E5');
 }
 
-export function downloadProjectExportPng(bundle) {
+/** Browser canvas limits — Chrome area ~16M px; keep headroom for encoding. */
+const PNG_MAX_CANVAS_AREA = 14_000_000;
+const PNG_MAX_DIMENSION = 8192;
+const PNG_WIDTH = 1400;
+const PNG_PAGE_PAD = 36;
+const PNG_TASK_BODY = 92;
+const PNG_SUB_HEADER = 36;
+const PNG_SUB_ROW = 44;
+const PNG_CARD_GAP = 14;
+const PNG_FOOTER = 48;
+const PNG_FIRST_HEADER = 380;
+const PNG_CONT_HEADER = 96;
+
+function measureTaskCardHeight(subCount) {
+  const n = Math.max(0, Number(subCount) || 0);
+  return PNG_TASK_BODY + (n > 0 ? PNG_SUB_HEADER + n * PNG_SUB_ROW : 0);
+}
+
+function pickPngScale(cssHeight) {
+  for (const scale of [2, 1.5, 1]) {
+    const w = Math.ceil(PNG_WIDTH * scale);
+    const h = Math.ceil(cssHeight * scale);
+    if (w <= PNG_MAX_DIMENSION && h <= PNG_MAX_DIMENSION && w * h <= PNG_MAX_CANVAS_AREA) {
+      return scale;
+    }
+  }
+  return 1;
+}
+
+function maxCssPageHeight(scale) {
+  const canvasW = Math.ceil(PNG_WIDTH * scale);
+  const byArea = Math.floor(PNG_MAX_CANVAS_AREA / canvasW);
+  const byDim = Math.floor(PNG_MAX_DIMENSION / scale);
+  return Math.max(900, Math.min(byArea, byDim) - 8);
+}
+
+/**
+ * Split tasks into page chunks that fit browser canvas limits.
+ * Oversized task cards (many subtasks) are split across pages.
+ */
+function buildPngPages(taskRows) {
+  const pages = [];
+  let pageIndex = 0;
+  let blocks = [];
+  let used = PNG_FIRST_HEADER;
+
+  const maxFor = (isFirst) => {
+    // Prefer scale 2 when possible; page packing uses scale-1 budget so pages stay safe.
+    const scale = pickPngScale(isFirst ? PNG_FIRST_HEADER + 400 : PNG_CONT_HEADER + 400);
+    return maxCssPageHeight(scale) - PNG_FOOTER - (isFirst ? PNG_FIRST_HEADER : PNG_CONT_HEADER);
+  };
+
+  const pushPage = () => {
+    if (!blocks.length) return;
+    pages.push({ isFirst: pageIndex === 0, blocks });
+    pageIndex += 1;
+    blocks = [];
+    used = PNG_CONT_HEADER;
+  };
+
+  taskRows.forEach((row, taskIndex) => {
+    const task = row.task || {};
+    const subs = Array.isArray(row.subtasks) ? row.subtasks : [];
+    let subOffset = 0;
+
+    while (subOffset <= subs.length) {
+      const isFirstPage = pages.length === 0 && blocks.length === 0;
+      const budget = maxFor(isFirstPage);
+      const remaining = Math.max(180, budget - used);
+
+      const headerOnly = measureTaskCardHeight(0);
+      const roomForSubs =
+        remaining <= headerOnly
+          ? 0
+          : Math.max(0, Math.floor((remaining - PNG_TASK_BODY - PNG_SUB_HEADER) / PNG_SUB_ROW));
+
+      let take = 0;
+      if (subs.length === 0 && subOffset === 0) {
+        take = 0;
+      } else if (subOffset === 0 && remaining < headerOnly + PNG_CARD_GAP) {
+        pushPage();
+        continue;
+      } else if (subOffset === 0) {
+        take = Math.min(subs.length, roomForSubs);
+        // If card still won't fit even with 0 subs, force a new page once.
+        if (take === 0 && subs.length > 0 && remaining < headerOnly + PNG_SUB_HEADER + PNG_SUB_ROW) {
+          if (blocks.length) {
+            pushPage();
+            continue;
+          }
+          take = Math.min(subs.length, Math.max(1, roomForSubs || 1));
+        }
+      } else {
+        // Continuation of subtasks for same task — need at least one row if possible.
+        if (remaining < headerOnly + PNG_SUB_HEADER + PNG_SUB_ROW && blocks.length) {
+          pushPage();
+          continue;
+        }
+        const contRoom = Math.max(
+          1,
+          Math.floor((remaining - PNG_TASK_BODY - PNG_SUB_HEADER) / PNG_SUB_ROW),
+        );
+        take = Math.min(subs.length - subOffset, contRoom);
+      }
+
+      const slice = subs.slice(subOffset, subOffset + take);
+      const cardH = measureTaskCardHeight(slice.length);
+      if (used + cardH + PNG_CARD_GAP > budget && blocks.length) {
+        pushPage();
+        continue;
+      }
+
+      blocks.push({
+        task,
+        taskIndex,
+        subtasks: slice,
+        subOffset,
+        subTotal: subs.length,
+        continued: subOffset > 0,
+      });
+      used += cardH + PNG_CARD_GAP;
+      subOffset += take;
+
+      if (subOffset >= subs.length) break;
+      // More subtasks remain — next loop iteration starts a new chunk (often new page).
+      if (blocks.length && used + headerOnly + PNG_SUB_HEADER + PNG_SUB_ROW > budget) {
+        pushPage();
+      }
+    }
+  });
+
+  pushPage();
+  if (!pages.length) {
+    pages.push({ isFirst: true, blocks: [] });
+  }
+  return pages;
+}
+
+function canvasToPngBlob(canvas) {
+  return new Promise((resolve, reject) => {
+    if (!canvas || typeof canvas.toBlob !== 'function') {
+      reject(new Error('Could not create PNG — canvas unavailable'));
+      return;
+    }
+    try {
+      canvas.toBlob((blob) => {
+        if (!blob) {
+          reject(
+            new Error(
+              'Could not create PNG — image too large for this browser. Try Excel (CSV) for full data.',
+            ),
+          );
+          return;
+        }
+        resolve(blob);
+      }, 'image/png');
+    } catch (err) {
+      reject(
+        new Error(
+          err?.message ||
+            'Could not create PNG — image too large for this browser. Try Excel (CSV) for full data.',
+        ),
+      );
+    }
+  });
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function drawPngPage(bundle, page, pageNumber, pageCount) {
   const p = bundle.project || {};
   const taskRows = Array.isArray(bundle.taskRows) ? bundle.taskRows : [];
-  const scale = 2;
-  const width = 1400;
-  const pagePad = 36;
+  const totalSubs = taskRows.reduce((n, row) => n + (row.subtasks?.length || 0), 0);
+  const width = PNG_WIDTH;
+  const pagePad = PNG_PAGE_PAD;
   const contentW = width - pagePad * 2;
   const rag = ragTone(p.rag);
   const status = statusTone(p.status);
   const delay = delayTone(p.delayDays);
   const progress = Math.max(0, Math.min(100, Number(p.progress) || 0));
-  const totalSubs = taskRows.reduce((n, row) => n + (row.subtasks?.length || 0), 0);
 
-  const measureTaskCard = (row) => {
-    const subs = row.subtasks?.length || 0;
-    return 92 + (subs > 0 ? 36 + subs * 44 : 0);
-  };
-
-  let yCursor = 0;
-  yCursor += 132;
-  yCursor += 168;
-  yCursor += 56;
-  for (const row of taskRows) yCursor += measureTaskCard(row) + 14;
-  yCursor += 48;
-  const height = Math.max(720, yCursor + pagePad);
+  let contentH = page.isFirst ? PNG_FIRST_HEADER : PNG_CONT_HEADER;
+  for (const block of page.blocks) {
+    contentH += measureTaskCardHeight(block.subtasks.length) + PNG_CARD_GAP;
+  }
+  contentH += PNG_FOOTER;
+  const height = Math.max(page.isFirst ? 720 : 520, contentH + pagePad);
+  const scale = pickPngScale(height);
 
   const canvas = document.createElement('canvas');
-  canvas.width = width * scale;
-  canvas.height = height * scale;
+  canvas.width = Math.ceil(width * scale);
+  canvas.height = Math.ceil(height * scale);
   const ctx = canvas.getContext('2d');
+  if (!ctx) {
+    throw new Error(
+      'Could not create PNG — canvas limit reached. Try Excel (CSV) for full data.',
+    );
+  }
   ctx.scale(scale, scale);
   ctx.textBaseline = 'alphabetic';
 
@@ -296,7 +466,6 @@ export function downloadProjectExportPng(bundle) {
   bg.addColorStop(1, '#F1F5F9');
   ctx.fillStyle = bg;
   ctx.fillRect(0, 0, width, height);
-
   fillRoundRect(ctx, 0, 0, width, 8, 0, '#1E62F0');
 
   let y = pagePad;
@@ -306,105 +475,117 @@ export function downloadProjectExportPng(bundle) {
   ctx.fillText('PROJECT HEALTH REPORT', pagePad, y + 12);
   ctx.textAlign = 'right';
   ctx.font = '500 11px Segoe UI, Arial, sans-serif';
-  ctx.fillText(`Exported ${todayStamp()}`, width - pagePad, y + 12);
+  const pageLabel =
+    pageCount > 1 ? `Page ${pageNumber} of ${pageCount}  ·  Exported ${todayStamp()}` : `Exported ${todayStamp()}`;
+  ctx.fillText(pageLabel, width - pagePad, y + 12);
   ctx.textAlign = 'left';
   y += 28;
 
-  ctx.fillStyle = '#0F172A';
-  ctx.font = '700 30px Segoe UI, Arial, sans-serif';
-  ctx.fillText(ellipsize(ctx, p.name, contentW - 280), pagePad, y + 26);
-  let badgeX = width - pagePad;
-  const badges = [
-    { label: text(p.status), tone: status },
-    { label: rag.label, tone: rag },
-    { label: delay.label, tone: delay },
-  ];
-  for (let i = badges.length - 1; i >= 0; i -= 1) {
-    ctx.font = '600 11px Segoe UI, Arial, sans-serif';
-    const w = Math.ceil(ctx.measureText(badges[i].label).width) + 20;
-    badgeX -= w;
-    drawBadge(ctx, badgeX, y + 4, badges[i].label, badges[i].tone);
-    badgeX -= 8;
-  }
-  y += 40;
-
-  ctx.fillStyle = '#64748B';
-  ctx.font = '500 13px Segoe UI, Arial, sans-serif';
-  ctx.fillText(text(p.displayId || p.id), pagePad, y + 8);
-  y += 28;
-
-  fillRoundRect(ctx, pagePad, y, contentW, 148, 18, '#FFFFFF');
-  strokeRoundRect(ctx, pagePad, y, contentW, 148, 18, '#E2E8F0');
-
-  const metrics = [
-    { label: 'OWNER', value: text(p.owner), person: true },
-    { label: 'START', value: formatExportDate(p.startDate) },
-    { label: 'END DATE', value: formatExportDate(p.originalEndDate || p.plannedEndDate) },
-    { label: 'REVISED', value: formatExportDate(p.revisedEndDate) },
-    { label: 'PRIORITY', value: text(p.priority) },
-    { label: 'COMPANY', value: text(p.companyName) },
-    { label: 'FUNCTION', value: text(p.lineOfBusiness) },
-    { label: 'CREATED', value: formatExportDate(p.createdAt) },
-  ];
-  const colW = contentW / 4;
-  metrics.forEach((item, idx) => {
-    const col = idx % 4;
-    const row = Math.floor(idx / 4);
-    const mx = pagePad + 18 + col * colW;
-    const my = y + 18 + row * 64;
-    ctx.fillStyle = '#94A3B8';
-    ctx.font = '700 10px Segoe UI, Arial, sans-serif';
-    ctx.fillText(item.label, mx, my + 10);
-    if (item.person) {
-      drawAvatar(ctx, mx, my + 18, item.value);
-      ctx.fillStyle = '#0F172A';
-      ctx.font = '600 14px Segoe UI, Arial, sans-serif';
-      ctx.fillText(ellipsize(ctx, item.value, colW - 54), mx + 30, my + 34);
-    } else {
-      ctx.fillStyle = '#0F172A';
-      ctx.font = '600 14px Segoe UI, Arial, sans-serif';
-      ctx.fillText(ellipsize(ctx, item.value, colW - 28), mx, my + 34);
+  if (page.isFirst) {
+    ctx.fillStyle = '#0F172A';
+    ctx.font = '700 30px Segoe UI, Arial, sans-serif';
+    ctx.fillText(ellipsize(ctx, p.name, contentW - 280), pagePad, y + 26);
+    let badgeX = width - pagePad;
+    const badges = [
+      { label: text(p.status), tone: status },
+      { label: rag.label, tone: rag },
+      { label: delay.label, tone: delay },
+    ];
+    for (let i = badges.length - 1; i >= 0; i -= 1) {
+      ctx.font = '600 11px Segoe UI, Arial, sans-serif';
+      const w = Math.ceil(ctx.measureText(badges[i].label).width) + 20;
+      badgeX -= w;
+      drawBadge(ctx, badgeX, y + 4, badges[i].label, badges[i].tone);
+      badgeX -= 8;
     }
-  });
-  y += 164;
+    y += 40;
 
-  fillRoundRect(ctx, pagePad, y, contentW, 44, 14, '#FFFFFF');
-  strokeRoundRect(ctx, pagePad, y, contentW, 44, 14, '#E2E8F0');
-  ctx.fillStyle = '#64748B';
-  ctx.font = '700 10px Segoe UI, Arial, sans-serif';
-  ctx.fillText('PROGRESS', pagePad + 18, y + 16);
-  ctx.fillStyle = '#0F172A';
-  ctx.font = '700 13px Segoe UI, Arial, sans-serif';
-  ctx.fillText(`${progress}%`, pagePad + 18, y + 34);
-  drawProgress(ctx, pagePad + 90, y + 18, contentW - 320, progress);
-  ctx.fillStyle = '#64748B';
-  ctx.font = '500 12px Segoe UI, Arial, sans-serif';
-  ctx.textAlign = 'right';
-  ctx.fillText(
-    `${taskRows.length} tasks  ·  ${totalSubs} subtasks`,
-    width - pagePad - 18,
-    y + 28,
-  );
-  ctx.textAlign = 'left';
-  y += 64;
+    ctx.fillStyle = '#64748B';
+    ctx.font = '500 13px Segoe UI, Arial, sans-serif';
+    ctx.fillText(text(p.displayId || p.id), pagePad, y + 8);
+    y += 28;
 
-  ctx.fillStyle = '#0F172A';
-  ctx.font = '700 16px Segoe UI, Arial, sans-serif';
-  ctx.fillText('Task & subtask breakdown', pagePad, y + 8);
-  ctx.fillStyle = '#64748B';
-  ctx.font = '500 12px Segoe UI, Arial, sans-serif';
-  ctx.fillText('Every assigned task with nested subtask details', pagePad + 260, y + 8);
-  y += 24;
+    fillRoundRect(ctx, pagePad, y, contentW, 148, 18, '#FFFFFF');
+    strokeRoundRect(ctx, pagePad, y, contentW, 148, 18, '#E2E8F0');
 
-  taskRows.forEach((row, index) => {
-    const task = row.task || {};
-    const subs = Array.isArray(row.subtasks) ? row.subtasks : [];
-    const cardH = measureTaskCard(row);
+    const metrics = [
+      { label: 'OWNER', value: text(p.owner), person: true },
+      { label: 'START', value: formatExportDate(p.startDate) },
+      { label: 'END DATE', value: formatExportDate(p.originalEndDate || p.plannedEndDate) },
+      { label: 'REVISED', value: formatExportDate(p.revisedEndDate) },
+      { label: 'PRIORITY', value: text(p.priority) },
+      { label: 'COMPANY', value: text(p.companyName) },
+      { label: 'FUNCTION', value: text(p.lineOfBusiness) },
+      { label: 'CREATED', value: formatExportDate(p.createdAt) },
+    ];
+    const colW = contentW / 4;
+    metrics.forEach((item, idx) => {
+      const col = idx % 4;
+      const row = Math.floor(idx / 4);
+      const mx = pagePad + 18 + col * colW;
+      const my = y + 18 + row * 64;
+      ctx.fillStyle = '#94A3B8';
+      ctx.font = '700 10px Segoe UI, Arial, sans-serif';
+      ctx.fillText(item.label, mx, my + 10);
+      if (item.person) {
+        drawAvatar(ctx, mx, my + 18, item.value);
+        ctx.fillStyle = '#0F172A';
+        ctx.font = '600 14px Segoe UI, Arial, sans-serif';
+        ctx.fillText(ellipsize(ctx, item.value, colW - 54), mx + 30, my + 34);
+      } else {
+        ctx.fillStyle = '#0F172A';
+        ctx.font = '600 14px Segoe UI, Arial, sans-serif';
+        ctx.fillText(ellipsize(ctx, item.value, colW - 28), mx, my + 34);
+      }
+    });
+    y += 164;
+
+    fillRoundRect(ctx, pagePad, y, contentW, 44, 14, '#FFFFFF');
+    strokeRoundRect(ctx, pagePad, y, contentW, 44, 14, '#E2E8F0');
+    ctx.fillStyle = '#64748B';
+    ctx.font = '700 10px Segoe UI, Arial, sans-serif';
+    ctx.fillText('PROGRESS', pagePad + 18, y + 16);
+    ctx.fillStyle = '#0F172A';
+    ctx.font = '700 13px Segoe UI, Arial, sans-serif';
+    ctx.fillText(`${progress}%`, pagePad + 18, y + 34);
+    drawProgress(ctx, pagePad + 90, y + 18, contentW - 320, progress);
+    ctx.fillStyle = '#64748B';
+    ctx.font = '500 12px Segoe UI, Arial, sans-serif';
+    ctx.textAlign = 'right';
+    ctx.fillText(
+      `${taskRows.length} tasks  ·  ${totalSubs} subtasks`,
+      width - pagePad - 18,
+      y + 28,
+    );
+    ctx.textAlign = 'left';
+    y += 64;
+
+    ctx.fillStyle = '#0F172A';
+    ctx.font = '700 16px Segoe UI, Arial, sans-serif';
+    ctx.fillText('Task & subtask breakdown', pagePad, y + 8);
+    ctx.fillStyle = '#64748B';
+    ctx.font = '500 12px Segoe UI, Arial, sans-serif';
+    ctx.fillText('Every assigned task with nested subtask details', pagePad + 260, y + 8);
+    y += 24;
+  } else {
+    ctx.fillStyle = '#0F172A';
+    ctx.font = '700 20px Segoe UI, Arial, sans-serif';
+    ctx.fillText(ellipsize(ctx, p.name, contentW - 200), pagePad, y + 18);
+    ctx.fillStyle = '#64748B';
+    ctx.font = '500 12px Segoe UI, Arial, sans-serif';
+    ctx.fillText(`${text(p.displayId || p.id)}  ·  continued`, pagePad, y + 40);
+    y += 56;
+  }
+
+  page.blocks.forEach((block) => {
+    const task = block.task || {};
+    const subs = Array.isArray(block.subtasks) ? block.subtasks : [];
+    const cardH = measureTaskCardHeight(subs.length);
     fillRoundRect(ctx, pagePad, y, contentW, cardH, 16, '#FFFFFF');
     strokeRoundRect(ctx, pagePad, y, contentW, cardH, 16, '#E2E8F0');
     fillRoundRect(ctx, pagePad, y, 6, cardH, 16, '#1E88E5');
 
-    const num = String(index + 1).padStart(2, '0');
+    const num = String((block.taskIndex || 0) + 1).padStart(2, '0');
     fillRoundRect(ctx, pagePad + 20, y + 16, 34, 24, 8, '#E8F0FE');
     ctx.fillStyle = '#1E62F0';
     ctx.font = '700 12px Segoe UI, Arial, sans-serif';
@@ -414,7 +595,8 @@ export function downloadProjectExportPng(bundle) {
 
     ctx.fillStyle = '#0F172A';
     ctx.font = '700 15px Segoe UI, Arial, sans-serif';
-    ctx.fillText(ellipsize(ctx, task.taskName, contentW - 360), pagePad + 64, y + 33);
+    const titleSuffix = block.continued ? ' (continued)' : '';
+    ctx.fillText(ellipsize(ctx, `${task.taskName || '—'}${titleSuffix}`, contentW - 360), pagePad + 64, y + 33);
 
     ctx.fillStyle = '#64748B';
     ctx.font = '500 11px Segoe UI, Arial, sans-serif';
@@ -446,14 +628,18 @@ export function downloadProjectExportPng(bundle) {
       rightX -= 8;
     }
 
-    if (subs.length) {
+    if (subs.length || block.subTotal > 0) {
       const listY = y + 96;
       ctx.fillStyle = '#94A3B8';
       ctx.font = '700 10px Segoe UI, Arial, sans-serif';
-      ctx.fillText(`SUBTASKS · ${subs.length}`, pagePad + 64, listY - 6);
+      const rangeLabel =
+        block.subTotal > subs.length
+          ? `SUBTASKS · ${block.subOffset + 1}–${block.subOffset + subs.length} of ${block.subTotal}`
+          : `SUBTASKS · ${subs.length}`;
+      ctx.fillText(rangeLabel, pagePad + 64, listY - 6);
 
       subs.forEach((sub, subIdx) => {
-        const sy = listY + 6 + subIdx * 44;
+        const sy = listY + 6 + subIdx * PNG_SUB_ROW;
         fillRoundRect(ctx, pagePad + 64, sy, contentW - 92, 38, 10, '#F8FAFC');
         ctx.fillStyle = '#FB8C00';
         ctx.font = '700 12px Segoe UI, Arial, sans-serif';
@@ -478,33 +664,49 @@ export function downloadProjectExportPng(bundle) {
       });
     }
 
-    y += cardH + 14;
+    y += cardH + PNG_CARD_GAP;
   });
 
   ctx.fillStyle = '#94A3B8';
   ctx.font = '500 11px Segoe UI, Arial, sans-serif';
   ctx.fillText(
-    'Project Tracker  ·  Confidential  ·  Generated from the project accordion',
+    pageCount > 1
+      ? `Project Tracker  ·  Confidential  ·  Page ${pageNumber}/${pageCount}`
+      : 'Project Tracker  ·  Confidential  ·  Generated from the project accordion',
     pagePad,
     height - 18,
   );
 
-  return new Promise((resolve, reject) => {
-    canvas.toBlob((blob) => {
-      if (!blob) {
-        reject(new Error('Could not create PNG'));
-        return;
-      }
-      downloadBlob(`${bundle.filenameBase}-${todayStamp()}.png`, blob);
-      resolve();
-    }, 'image/png');
-  });
+  return canvas;
+}
+
+export async function downloadProjectExportPng(bundle) {
+  const taskRows = Array.isArray(bundle.taskRows) ? bundle.taskRows : [];
+  const pages = buildPngPages(taskRows);
+  const pageCount = pages.length;
+  const stamp = todayStamp();
+  const base = bundle.filenameBase || 'project';
+
+  for (let i = 0; i < pageCount; i += 1) {
+    const canvas = drawPngPage(bundle, pages[i], i + 1, pageCount);
+    const blob = await canvasToPngBlob(canvas);
+    const name =
+      pageCount === 1
+        ? `${base}-${stamp}.png`
+        : `${base}-${stamp}-page-${String(i + 1).padStart(2, '0')}-of-${String(pageCount).padStart(2, '0')}.png`;
+    downloadBlob(name, blob);
+    // Let the browser finish each download before starting the next.
+    if (i < pageCount - 1) await sleep(350);
+  }
+
+  return { pageCount };
 }
 
 export async function exportProjectAccordion(kind, bundle) {
   if (kind === 'csv') {
     downloadProjectExportCsv(bundle);
-    return;
+    return { kind: 'csv' };
   }
-  await downloadProjectExportPng(bundle);
+  const result = await downloadProjectExportPng(bundle);
+  return { kind: 'png', ...result };
 }

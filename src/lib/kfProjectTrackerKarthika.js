@@ -2,6 +2,7 @@ import { kf as globalKf } from '@/sdk/index.js';
 import { kfMutateJson, KF_ADMIN_PAGE_SIZE } from './kfRuntime.js';
 import {
   enrichRawSubtaskRowsWithInstanceDetail,
+  resolveCurrentActivityInstanceId,
   resolveSubtaskDisplayName,
 } from './kfSubtaskTracker.js';
 
@@ -250,9 +251,7 @@ function mapSubtaskRow(row) {
     extra: 0,
     peopleCount: assigneePerson ? 1 : 0,
     due: formatDate(row?._created_at),
-    activityInstanceId: Array.isArray(row?._activity_instance_id)
-      ? row._activity_instance_id[0]
-      : row?._activity_instance_id || null,
+    activityInstanceId: resolveCurrentActivityInstanceId(row) || null,
     children: [],
     raw: row,
   };
@@ -375,7 +374,7 @@ function flattenProcessRowByColumns(row, columns) {
   return out;
 }
 
-export async function fetchAllSubtasks(kfInstance) {
+export async function fetchAllSubtasks(kfInstance, options = {}) {
   const kf = resolveKf(kfInstance);
   const accId = kf.account._id;
   const path = SUBTASKS_ADMIN_PATH.replace('{acc}', accId);
@@ -389,22 +388,33 @@ export async function fetchAllSubtasks(kfInstance) {
   const data = (Array.isArray(response?.Data) ? response.Data : []).map((row) =>
     flattenProcessRowByColumns(row, columns),
   );
-  // Admin list often omits Sub_task_Name; merge instance detail so accordion titles match.
-  const enriched = await enrichRawSubtaskRowsWithInstanceDetail(kfInstance, data, {
-    maxRows: 150,
-    concurrency: 8,
-  });
+  const enrichDetails = options.enrichDetails !== false;
+  const rows = enrichDetails
+    ? await enrichRawSubtaskRowsWithInstanceDetail(kfInstance, data, {
+        maxRows: Number.isFinite(Number(options.maxRows)) ? Number(options.maxRows) : 150,
+        concurrency: 8,
+      })
+    : data;
 
   return {
-    items: enriched.map((row) => mapSubtaskRow(row)),
+    items: rows.map((row) => mapSubtaskRow(row)),
     raw: response,
   };
+}
+
+function createdAtMs(row) {
+  const raw = row?.raw?._created_at || row?._created_at || row?.createdDate || row?.createdAt;
+  if (!raw) return 0;
+  const t = Date.parse(String(raw));
+  return Number.isNaN(t) ? 0 : t;
 }
 
 export function filterSubtasksForTask(allSubtasks, taskBusinessId) {
   const key = String(taskBusinessId || '').trim();
   if (!key) return [];
-  return (allSubtasks || []).filter((item) => item.parentTaskBusinessId === key);
+  return (allSubtasks || [])
+    .filter((item) => item.parentTaskBusinessId === key)
+    .sort((a, b) => createdAtMs(b) - createdAtMs(a));
 }
 
 export function attachSubtaskCounts(tasks, allSubtasks) {

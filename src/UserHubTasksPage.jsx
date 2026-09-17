@@ -256,8 +256,8 @@ export default function UserHubTasksPage({ useLayout = false }) {
   }, [kfInstance, scheduleRefreshAfterPopup]);
 
   return (
-    <div className="min-h-screen overflow-x-clip bg-gradient-to-b from-[#edf1ff] via-[#f6f8ff] to-[#f2ecff]">
-      <div className="mx-auto min-w-0 max-w-[1800px] p-3 pb-6 sm:p-6">
+    <div className="min-h-screen overflow-x-visible bg-gradient-to-b from-[#edf1ff] via-[#f6f8ff] to-[#f2ecff]">
+      <div className="mx-auto min-w-0 max-w-[1800px] overflow-x-visible px-4 pb-6 pt-3 sm:px-6 sm:pt-6">
         <ProjectDashboardPage
           useLayout={useLayout}
           scopeToCurrentUser

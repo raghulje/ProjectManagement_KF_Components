@@ -11,10 +11,6 @@ function getAccountId(kfInstance) {
   return resolveKissflowAccountId(kfInstance, DEFAULT_ACCOUNT_ID);
 }
 
-function getFieldsPath(accountId) {
-  return `/case/2/${accountId}/${CASE_ID}/fields`;
-}
-
 /** Prefer case /list (honors page_size). View list/items caps ~21/page and needs walking. */
 function getProjectListPath(accountId, pageNumber = 1, pageSize = 500) {
   const pn = Math.max(1, Number(pageNumber) || 1);
@@ -310,9 +306,19 @@ export function mapItemsToProjectRows(items, detailById, activityById, available
     const status = mapStatus(detail?._status_name || item?._status_name || detail?._category || item?._category || '');
     const dueDate = parseKfDate(detail?.End_Date || detail?.DueDate || item?.DueDate);
     const startDate = parseKfDate(detail?.Start_Date || detail?._start_date || item?._start_date || item?._created_at);
-    const timeline = Array.isArray(detail?.['Table::Project_Timeline_History']) ? detail['Table::Project_Timeline_History'] : [];
+    const timeline = Array.isArray(detail?.['Table::Project_Timeline_History'])
+      ? detail['Table::Project_Timeline_History']
+      : Array.isArray(detail?.Project_Timeline_History)
+        ? detail.Project_Timeline_History
+        : Array.isArray(item?.Project_Timeline_History)
+          ? item.Project_Timeline_History
+          : [];
     const activities = Array.isArray(activityById[id]) ? activityById[id] : [];
-    const subtasks = Array.isArray(detail?.['Table::Project_Subtasks']) ? detail['Table::Project_Subtasks'] : [];
+    const subtasks = Array.isArray(detail?.['Table::Project_Subtasks'])
+      ? detail['Table::Project_Subtasks']
+      : Array.isArray(detail?.Project_Subtasks)
+        ? detail.Project_Subtasks
+        : [];
     const completedTasks = subtasks.filter((s) => mapSubtaskStatus(s?.Task_Status_1, s?.End_date_2) === 'Completed').length;
     const totalTasks = subtasks.length;
     const progressFromApi = Number(detail?.Project_Objectives ?? item?.Project_Objectives);
@@ -468,30 +474,42 @@ async function fetchJson(kfInstance, path) {
   return kfGetJson(kfInstance, path);
 }
 
-/** Loads all project rows + flattened subtasks from the same Kissflow endpoints as the CTO dashboard. */
+/** Case /list already includes form fields + Project_Timeline_History (no Table:: prefix). */
+function projectListItemAsDetail(item) {
+  if (!item || typeof item !== 'object') return {};
+  const timeline = item['Table::Project_Timeline_History'] ?? item.Project_Timeline_History;
+  const embedded = item['Table::Project_Subtasks'] ?? item.Project_Subtasks;
+  return {
+    ...item,
+    'Table::Project_Timeline_History': Array.isArray(timeline) ? timeline : [],
+    'Table::Project_Subtasks': Array.isArray(embedded) ? embedded : [],
+  };
+}
+
+function detailByIdFromListItems(listItems) {
+  const detailById = {};
+  for (const item of listItems) {
+    const id = item?._item_id || item?._id;
+    if (!id) continue;
+    detailById[id] = projectListItemAsDetail(item);
+  }
+  return detailById;
+}
+
+/** Loads all project rows from the case list — no per-project detail/activity N+1. */
 export async function fetchProjectDashboardData(kfInstance) {
   if (!kfInstance?.api) {
     throw new Error('Kissflow SDK not ready — open this page inside Kissflow.');
   }
 
-  const { rows, listItems, fieldIds, accountId } = await fetchProjectListSummary(kfInstance);
-  const itemIds = listItems.map((x) => x?._item_id || x?._id).filter(Boolean);
-  const enriched = await enrichProjectRows(kfInstance, {
-    listItems,
-    itemIds,
-    fieldIds,
-    accountId,
-    concurrency: 6,
-  });
-  const byId = Object.fromEntries(enriched.map((row) => [row.id, row]));
-  const fullRows = rows.map((row) => byId[row.id] || row);
-  const subtasks = fullRows.flatMap((r) => r.subtasks || []);
-  return { rows: fullRows, subtasks };
+  const { rows } = await fetchProjectListSummary(kfInstance);
+  const subtasks = rows.flatMap((r) => r.subtasks || []);
+  return { rows, subtasks };
 }
 
 /**
- * Fast path: fields + list only (2 API calls). Rows use list-item fields; detail/activity empty.
- * Use enrichProjectRows() for per-project detail when needed (employee dashboard).
+ * Fast path: case /list only. List rows already include owners, dates, and timeline.
+ * Use enrichProjectRows() only when a screen needs activity history.
  */
 export async function fetchProjectListSummary(kfInstance) {
   if (!kfInstance?.api) {
@@ -499,17 +517,10 @@ export async function fetchProjectListSummary(kfInstance) {
   }
 
   const accountId = getAccountId(kfInstance);
-  const fieldsPath = getFieldsPath(accountId);
+  const listItems = await fetchAllProjectListItems(kfInstance, accountId);
+  const rows = mapItemsToProjectRows(listItems, detailByIdFromListItems(listItems), {}, null);
 
-  const [fieldsResponse, listItems] = await Promise.all([
-    fetchJson(kfInstance, fieldsPath),
-    fetchAllProjectListItems(kfInstance, accountId),
-  ]);
-
-  const fieldIds = new Set((Array.isArray(fieldsResponse) ? fieldsResponse : []).map((f) => f?.Id).filter(Boolean));
-  const rows = mapItemsToProjectRows(listItems, {}, {}, fieldIds);
-
-  return { rows, listItems, fieldIds, accountId };
+  return { rows, listItems, fieldIds: null, accountId };
 }
 
 /** Detail + activity for one project (modal / background enrich). */

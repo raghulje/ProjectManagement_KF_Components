@@ -11,6 +11,13 @@ import UserHubTaskToolbar from './components/UserHubTaskToolbar.jsx';
 import TablePaginationBar, { PT_TABLE_PAGE_SIZE } from './components/TablePaginationBar.jsx';
 import PtUserAvatar from './components/PtUserAvatar.jsx';
 import DashboardPeriodPicker, { getEmptyPeriodState } from './components/DashboardPeriodPicker.jsx';
+import {
+  TableColumnHeader,
+  distinctFilterOptions,
+  toggleSortState,
+  compareText,
+  compareNumber,
+} from './components/TableColumnHeaders.jsx';
 import { useUserHubSession } from './lib/useUserHubSession.js';
 import {
   deleteSubtaskDraftRecords,
@@ -27,7 +34,7 @@ import {
   openUserHubSubtaskProcessPopup,
 } from './lib/kfUserHubPopups.js';
 import { isSubtaskCompleted } from './lib/kfSubtaskTracker.js';
-import { matchesCreatedDateRange } from './lib/dashboardCreatedDateFilters.js';
+import { compareCreatedAt, matchesCreatedDateRange } from './lib/dashboardCreatedDateFilters.js';
 
 const EMPTY_STATUS_COUNTS = {
   Draft: 0,
@@ -39,6 +46,22 @@ const EMPTY_STATUS_COUNTS = {
 
 /** Stable default — `selectedMembers = []` would reset table page every render. */
 const EMPTY_SELECTED_MEMBERS = [];
+
+const SUBTASK_TABLE_COLUMNS = [
+  { key: 'subtaskName', label: 'Subtask', filter: 'subtaskName' },
+  { key: 'parentTask', label: 'Parent task', filter: 'parentTask' },
+  { key: 'project', label: 'Project', filter: 'project' },
+  { key: 'assignee', label: 'Assigned to', filter: 'assignee' },
+  { key: 'priority', label: 'Priority', filter: 'priority' },
+  { key: 'created', label: 'Created' },
+  { key: 'aging', label: 'Aging' },
+  { key: 'status', label: 'Status', filter: 'status' },
+];
+
+function isBlankCell(value) {
+  const v = String(value ?? '').trim();
+  return !v || v === '—' || v === '-';
+}
 
 function resolveSubtaskCreatedRanges(periodFrom, periodTo, periodRanges) {
   if (Array.isArray(periodRanges) && periodRanges.length > 0) {
@@ -132,6 +155,14 @@ export default function UserHubSubTasksPage({
   const [tablePage, setTablePage] = useState(1);
   const [search, setSearch] = useState('');
   const [creating, setCreating] = useState(false);
+  const [sortKey, setSortKey] = useState('created');
+  const [sortDir, setSortDir] = useState('desc');
+  const [subtaskNameFilter, setSubtaskNameFilter] = useState('all');
+  const [parentTaskFilter, setParentTaskFilter] = useState('all');
+  const [projectFilter, setProjectFilter] = useState('all');
+  const [assigneeFilter, setAssigneeFilter] = useState('all');
+  const [priorityFilter, setPriorityFilter] = useState('all');
+  const [statusColumnFilter, setStatusColumnFilter] = useState('all');
 
   void useLayout;
 
@@ -207,6 +238,12 @@ export default function UserHubSubTasksPage({
   useEffect(() => {
     setSelectedDraftIds(new Set());
     setTablePage(1);
+    setSubtaskNameFilter('all');
+    setParentTaskFilter('all');
+    setProjectFilter('all');
+    setAssigneeFilter('all');
+    setPriorityFilter('all');
+    setStatusColumnFilter('all');
   }, [taskScope, createdStatusFilter, assignedStatus, myTeamMode]);
 
   const selectedMembersKey = useMemo(
@@ -221,7 +258,23 @@ export default function UserHubSubTasksPage({
 
   useEffect(() => {
     setTablePage(1);
-  }, [search, selectedMembersKey, myTeamRowsLen, periodFrom, periodTo, periodRangesKey, periodMode]);
+  }, [
+    search,
+    selectedMembersKey,
+    myTeamRowsLen,
+    periodFrom,
+    periodTo,
+    periodRangesKey,
+    periodMode,
+    sortKey,
+    sortDir,
+    subtaskNameFilter,
+    parentTaskFilter,
+    projectFilter,
+    assigneeFilter,
+    priorityFilter,
+    statusColumnFilter,
+  ]);
 
   const handleTaskScopeChange = useCallback((scope) => {
     setTaskScope(scope);
@@ -236,6 +289,112 @@ export default function UserHubSubTasksPage({
     if (myTeamMode) return Array.isArray(myTeamRows) ? myTeamRows : [];
     return processSubtasks;
   }, [myTeamMode, myTeamRows, processSubtasks]);
+
+  const subtaskNameOptions = useMemo(
+    () => distinctFilterOptions(sourceRows, (r) => r.subtaskName, { allLabel: 'All Subtasks' }),
+    [sourceRows],
+  );
+  const parentTaskOptions = useMemo(
+    () =>
+      distinctFilterOptions(sourceRows, (r) => r.parentTaskName, {
+        allLabel: 'All Parent tasks',
+        emptyValue: '__blank__',
+        emptyLabel: 'No parent task',
+      }),
+    [sourceRows],
+  );
+  const projectOptions = useMemo(
+    () =>
+      distinctFilterOptions(sourceRows, (r) => r.projectName, {
+        allLabel: 'All Projects',
+        emptyValue: '__blank__',
+        emptyLabel: 'No project',
+      }),
+    [sourceRows],
+  );
+  const assigneeOptions = useMemo(
+    () =>
+      distinctFilterOptions(sourceRows, (r) => r.assignedTo || r.assignee, {
+        allLabel: 'All Assignees',
+      }),
+    [sourceRows],
+  );
+  const priorityOptions = useMemo(
+    () =>
+      distinctFilterOptions(sourceRows, (r) => r.priority, {
+        allLabel: 'All Priority',
+        emptyValue: '__blank__',
+        emptyLabel: 'No priority',
+      }),
+    [sourceRows],
+  );
+  const statusOptions = useMemo(
+    () =>
+      distinctFilterOptions(sourceRows, (r) => r.status, {
+        allLabel: 'All Status',
+        emptyValue: '__blank__',
+        emptyLabel: 'No status',
+      }),
+    [sourceRows],
+  );
+
+  const columnFilterProps = useMemo(
+    () => ({
+      subtaskName: {
+        filterValue: subtaskNameFilter,
+        onFilterChange: setSubtaskNameFilter,
+        filterOptions: subtaskNameOptions,
+      },
+      parentTask: {
+        filterValue: parentTaskFilter,
+        onFilterChange: setParentTaskFilter,
+        filterOptions: parentTaskOptions,
+      },
+      project: {
+        filterValue: projectFilter,
+        onFilterChange: setProjectFilter,
+        filterOptions: projectOptions,
+      },
+      assignee: {
+        filterValue: assigneeFilter,
+        onFilterChange: setAssigneeFilter,
+        filterOptions: assigneeOptions,
+      },
+      priority: {
+        filterValue: priorityFilter,
+        onFilterChange: setPriorityFilter,
+        filterOptions: priorityOptions,
+      },
+      status: {
+        filterValue: statusColumnFilter,
+        onFilterChange: setStatusColumnFilter,
+        filterOptions: statusOptions,
+      },
+    }),
+    [
+      subtaskNameFilter,
+      parentTaskFilter,
+      projectFilter,
+      assigneeFilter,
+      priorityFilter,
+      statusColumnFilter,
+      subtaskNameOptions,
+      parentTaskOptions,
+      projectOptions,
+      assigneeOptions,
+      priorityOptions,
+      statusOptions,
+    ],
+  );
+
+  const handleSort = useCallback(
+    (key) => {
+      const next = toggleSortState(sortKey, sortDir, key);
+      setSortKey(next.sortKey);
+      setSortDir(next.sortDir);
+    },
+    [sortKey, sortDir],
+  );
 
   const filteredRows = useMemo(() => {
     let rows = sourceRows;
@@ -253,24 +412,82 @@ export default function UserHubSubTasksPage({
       );
     }
 
+    if (subtaskNameFilter !== 'all') {
+      rows = rows.filter((row) => String(row.subtaskName || '').trim() === subtaskNameFilter);
+    }
+    if (parentTaskFilter === '__blank__') {
+      rows = rows.filter((row) => isBlankCell(row.parentTaskName));
+    } else if (parentTaskFilter !== 'all') {
+      rows = rows.filter((row) => String(row.parentTaskName || '').trim() === parentTaskFilter);
+    }
+    if (projectFilter === '__blank__') {
+      rows = rows.filter((row) => isBlankCell(row.projectName));
+    } else if (projectFilter !== 'all') {
+      rows = rows.filter((row) => String(row.projectName || '').trim() === projectFilter);
+    }
+    if (assigneeFilter !== 'all') {
+      rows = rows.filter(
+        (row) => String(row.assignedTo || row.assignee || '').trim() === assigneeFilter,
+      );
+    }
+    if (priorityFilter === '__blank__') {
+      rows = rows.filter((row) => isBlankCell(row.priority));
+    } else if (priorityFilter !== 'all') {
+      rows = rows.filter((row) => String(row.priority || '').trim() === priorityFilter);
+    }
+    if (statusColumnFilter === '__blank__') {
+      rows = rows.filter((row) => isBlankCell(row.status));
+    } else if (statusColumnFilter !== 'all') {
+      rows = rows.filter((row) => String(row.status || '').trim() === statusColumnFilter);
+    }
+
     const q = String(search || '').trim().toLowerCase();
-    if (!q) return rows;
-    return rows.filter((row) => {
-      const hay = [
-        row.subtaskName,
-        row.summary,
-        row.parentTaskName,
-        row.parentTaskId,
-        row.assignedTo,
-        row.assignee,
-        row.status,
-        row.createdBy,
-        row.projectId,
-      ]
-        .map((v) => String(v || '').toLowerCase())
-        .join(' ');
-      return hay.includes(q);
+    const matched = !q
+      ? rows
+      : rows.filter((row) => {
+          const hay = [
+            row.subtaskName,
+            row.summary,
+            row.parentTaskName,
+            row.parentTaskId,
+            row.projectName,
+            row.assignedTo,
+            row.assignee,
+            row.status,
+            row.createdBy,
+            row.projectId,
+            row.priority,
+          ]
+            .map((v) => String(v || '').toLowerCase())
+            .join(' ');
+          return hay.includes(q);
+        });
+
+    const copy = [...matched];
+    const dir = sortDir === 'asc' ? 1 : -1;
+    copy.sort((a, b) => {
+      switch (sortKey) {
+        case 'subtaskName':
+          return compareText(a.subtaskName, b.subtaskName, dir);
+        case 'parentTask':
+          return compareText(a.parentTaskName, b.parentTaskName, dir);
+        case 'project':
+          return compareText(a.projectName, b.projectName, dir);
+        case 'assignee':
+          return compareText(a.assignedTo || a.assignee, b.assignedTo || b.assignee, dir);
+        case 'priority':
+          return compareText(a.priority, b.priority, dir);
+        case 'created':
+          return compareCreatedAt(a, b, dir, sortDir, getSubtaskCreatedValue);
+        case 'aging':
+          return compareNumber(a.agingDays, b.agingDays, dir);
+        case 'status':
+          return compareText(a.status, b.status, dir);
+        default:
+          return compareCreatedAt(a, b, -1, 'desc', getSubtaskCreatedValue);
+      }
     });
+    return copy;
   }, [
     sourceRows,
     search,
@@ -279,6 +496,14 @@ export default function UserHubSubTasksPage({
     periodFrom,
     periodTo,
     periodRanges,
+    subtaskNameFilter,
+    parentTaskFilter,
+    projectFilter,
+    assigneeFilter,
+    priorityFilter,
+    statusColumnFilter,
+    sortKey,
+    sortDir,
   ]);
 
   const handlePeriodChange = useCallback((next) => {
@@ -428,7 +653,7 @@ export default function UserHubSubTasksPage({
       ? 'Subtasks Created by Me'
       : 'Subtasks Assigned to me';
 
-  const colSpan = (showDraftBulkSelect ? 1 : 0) + 7;
+  const colSpan = (showDraftBulkSelect ? 1 : 0) + 8;
   const isTableLoading = myTeamMode ? Boolean(myTeamLoading) : processSubtasksLoading;
 
   return (
@@ -436,12 +661,12 @@ export default function UserHubSubTasksPage({
       className={
         embedded
           ? 'min-w-0'
-          : 'min-h-screen overflow-x-clip bg-gradient-to-b from-[#edf1ff] via-[#f6f8ff] to-[#f2ecff]'
+          : 'min-h-screen overflow-x-visible bg-gradient-to-b from-[#edf1ff] via-[#f6f8ff] to-[#f2ecff]'
       }
     >
-      <div className={embedded ? 'space-y-4' : 'mx-auto min-w-0 max-w-[1800px] space-y-4 p-3 pb-6 sm:p-6'}>
+      <div className={embedded ? 'space-y-4' : 'mx-auto min-w-0 max-w-[1800px] space-y-4 overflow-x-visible px-4 pb-6 pt-3 sm:px-6 sm:pt-6'}>
         {!embedded ? (
-          <div className="flex flex-col gap-2.5 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
+          <div className="flex flex-col gap-2.5 min-[640px]:flex-row min-[640px]:items-center min-[640px]:justify-between min-[640px]:gap-3">
             <UserHubWelcome
               greeting={greeting}
               firstName={firstName}
@@ -544,7 +769,7 @@ export default function UserHubSubTasksPage({
             </div>
           </div>
 
-          <div className="hidden overflow-x-auto lg:block">
+          <div className="hidden overflow-x-auto md:block">
             <table className="w-full min-w-[720px]">
               <thead>
                 <tr className="border-b border-slate-100 bg-slate-50/70">
@@ -559,27 +784,21 @@ export default function UserHubSubTasksPage({
                       />
                     </th>
                   ) : null}
-                  <th className="px-5 py-3 text-left text-xs font-semibold uppercase tracking-wider text-slate-500">
-                    Subtask
-                  </th>
-                  <th className="px-5 py-3 text-left text-xs font-semibold uppercase tracking-wider text-slate-500">
-                    Parent task
-                  </th>
-                  <th className="px-5 py-3 text-left text-xs font-semibold uppercase tracking-wider text-slate-500">
-                    Assigned to
-                  </th>
-                  <th className="px-5 py-3 text-left text-xs font-semibold uppercase tracking-wider text-slate-500">
-                    Priority
-                  </th>
-                  <th className="px-5 py-3 text-left text-xs font-semibold uppercase tracking-wider text-slate-500">
-                    Created
-                  </th>
-                  <th className="px-5 py-3 text-left text-xs font-semibold uppercase tracking-wider text-slate-500">
-                    Aging
-                  </th>
-                  <th className="px-5 py-3 text-left text-xs font-semibold uppercase tracking-wider text-slate-500">
-                    Status
-                  </th>
+                  {SUBTASK_TABLE_COLUMNS.map((col) => {
+                    const filterCfg = col.filter ? columnFilterProps[col.filter] : null;
+                    return (
+                      <TableColumnHeader
+                        key={col.key}
+                        col={col}
+                        sortKey={sortKey}
+                        sortDir={sortDir}
+                        onSort={handleSort}
+                        filterValue={filterCfg?.filterValue}
+                        filterOptions={filterCfg?.filterOptions}
+                        onFilterChange={filterCfg?.onFilterChange}
+                      />
+                    );
+                  })}
                 </tr>
               </thead>
               <tbody>
@@ -618,6 +837,14 @@ export default function UserHubSubTasksPage({
                         <td className="px-5 py-3">
                           <span className="inline-block max-w-[160px] truncate rounded-lg bg-blue-50 px-2 py-0.5 text-[11px] text-[#1E88E5]">
                             {row.parentTaskName || '—'}
+                          </span>
+                        </td>
+                        <td className="px-5 py-3">
+                          <span
+                            className="inline-block max-w-[160px] truncate rounded-lg bg-blue-50 px-2 py-0.5 text-[11px] font-medium text-[#1E88E5]"
+                            title={row.projectName && row.projectName !== '—' ? row.projectName : undefined}
+                          >
+                            {row.projectName && row.projectName !== '—' ? row.projectName : '—'}
                           </span>
                         </td>
                         <td className="px-5 py-3">
@@ -662,7 +889,7 @@ export default function UserHubSubTasksPage({
             </table>
           </div>
 
-          <div className="space-y-2 p-3 lg:hidden">
+          <div className="space-y-2 p-3 md:hidden">
             {pageRows.length === 0 ? (
               <p className="py-8 text-center text-xs text-slate-500">No subtasks found</p>
             ) : (
@@ -701,6 +928,11 @@ export default function UserHubSubTasksPage({
                         {row.parentTaskName && row.parentTaskName !== '—' ? (
                           <p className="mt-0.5 truncate text-[11px] text-[#1E88E5]">
                             {row.parentTaskName}
+                          </p>
+                        ) : null}
+                        {row.projectName && row.projectName !== '—' ? (
+                          <p className="mt-0.5 truncate text-[11px] text-slate-500">
+                            {row.projectName}
                           </p>
                         ) : null}
                         <div className="mt-2 flex min-w-0 items-center gap-2 border-t border-slate-100 pt-2 text-[11px] text-slate-600">

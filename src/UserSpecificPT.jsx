@@ -60,6 +60,8 @@ import {
 } from './lib/kfTaskTracker.js';
 import {
   matchesCreatedDateRange,
+  compareCreatedAt,
+  sortByCreatedAtDesc,
 } from './lib/dashboardCreatedDateFilters.js';
 import {
   collectUniqueDimensionValues,
@@ -131,6 +133,17 @@ const USPT_DEFAULT_TABLE_FILTERS = {
   taskOwnershipScope: 'assigned',
   assignedStatus: 'open',
   createdStatusFilter: 'Draft',
+  companyFilter: '',
+  lineOfBusinessFilter: '',
+  functionTypeFilter: '',
+  periodMode: 'all',
+  periodFrom: '',
+  periodTo: '',
+  periodLabel: 'All time',
+  periodRanges: [],
+  periodParts: [],
+  periodFyStartYear: null,
+  search: '',
 };
 
 function usptPageFiltersViewKey(scope, mode) {
@@ -173,6 +186,10 @@ function pickUsptTableFilters(source = {}) {
     const v = source?.[key];
     return v == null || v === '' ? fallback : v;
   };
+  const emptyPeriod = getEmptyPeriodState();
+  const periodMode = pick('periodMode', USPT_DEFAULT_TABLE_FILTERS.periodMode);
+  const periodFrom = pick('periodFrom', emptyPeriod.range?.from || '');
+  const periodTo = pick('periodTo', emptyPeriod.range?.to || '');
   return {
     nameFilter: pick('nameFilter', USPT_DEFAULT_TABLE_FILTERS.nameFilter),
     ownerOrProjectFilter: pick('ownerOrProjectFilter', USPT_DEFAULT_TABLE_FILTERS.ownerOrProjectFilter),
@@ -185,6 +202,28 @@ function pickUsptTableFilters(source = {}) {
     taskOwnershipScope: pick('taskOwnershipScope', USPT_DEFAULT_TABLE_FILTERS.taskOwnershipScope),
     assignedStatus: pick('assignedStatus', USPT_DEFAULT_TABLE_FILTERS.assignedStatus),
     createdStatusFilter: pick('createdStatusFilter', USPT_DEFAULT_TABLE_FILTERS.createdStatusFilter),
+    companyFilter: pick('companyFilter', USPT_DEFAULT_TABLE_FILTERS.companyFilter),
+    lineOfBusinessFilter: pick(
+      'lineOfBusinessFilter',
+      USPT_DEFAULT_TABLE_FILTERS.lineOfBusinessFilter,
+    ),
+    functionTypeFilter: pick('functionTypeFilter', USPT_DEFAULT_TABLE_FILTERS.functionTypeFilter),
+    periodMode,
+    periodFrom,
+    periodTo,
+    periodLabel: pick(
+      'periodLabel',
+      periodMode === 'all' ? emptyPeriod.summaryLabel || 'All time' : USPT_DEFAULT_TABLE_FILTERS.periodLabel,
+    ),
+    periodRanges: Array.isArray(source?.periodRanges) ? source.periodRanges : [],
+    periodParts: Array.isArray(source?.periodParts) ? source.periodParts : [],
+    periodFyStartYear:
+      source?.periodFyStartYear == null || source?.periodFyStartYear === ''
+        ? null
+        : Number.isFinite(Number(source.periodFyStartYear))
+          ? Number(source.periodFyStartYear)
+          : null,
+    search: pick('search', USPT_DEFAULT_TABLE_FILTERS.search),
   };
 }
 
@@ -648,7 +687,7 @@ function filterTasksForProject(allTasks, project) {
   const pname = String(project?.name ?? '').trim().toLowerCase();
   if (!projectIds.size && !pname) return [];
 
-  return rows.filter((t) => {
+  const linked = rows.filter((t) => {
     const taskIds = [
       ...(Array.isArray(t?.projectIds) ? t.projectIds : []),
       t?.projectId,
@@ -659,6 +698,7 @@ function filterTasksForProject(allTasks, project) {
     const tProject = String(t?.project ?? '').trim().toLowerCase();
     return Boolean(pname && tProject && tProject === pname);
   });
+  return sortByCreatedAtDesc(linked);
 }
 
 function isEmptyProjectName(projectName) {
@@ -703,8 +743,8 @@ function MyWorkProjectTasksPanel({
   const [nameFilter, setNameFilter] = useState('all');
   const [assigneeFilter, setAssigneeFilter] = useState('all');
   const [statusFilter, setStatusFilter] = useState('all');
-  const [sortKey, setSortKey] = useState('name');
-  const [sortDir, setSortDir] = useState('asc');
+  const [sortKey, setSortKey] = useState('createdAt');
+  const [sortDir, setSortDir] = useState('desc');
   const [expandedTaskIds, setExpandedTaskIds] = useState(() => new Set());
 
   const nameOptions = useMemo(
@@ -751,8 +791,10 @@ function MyWorkProjectTasksPanel({
           return compareNumber(parseDelayDays(a), parseDelayDays(b), dir);
         case 'status':
           return compareText(a.status, b.status, dir);
+        case 'createdAt':
+          return compareCreatedAt(a, b, dir, sortDir);
         default:
-          return 0;
+          return compareCreatedAt(a, b, -1, 'desc');
       }
     });
     return copy;
@@ -1240,8 +1282,8 @@ export default function UserSpecificPT({ useLayout = false }) {
   ); // tasks: priority, projects: health
   const [nameFilter, setNameFilter] = useState(USPT_DEFAULT_TABLE_FILTERS.nameFilter);
   const [assigneeFilter, setAssigneeFilter] = useState(USPT_DEFAULT_TABLE_FILTERS.assigneeFilter);
-  const [sortKey, setSortKey] = useState('name');
-  const [sortDir, setSortDir] = useState('asc');
+  const [sortKey, setSortKey] = useState('createdAt');
+  const [sortDir, setSortDir] = useState('desc');
   const [expandedProjectId, setExpandedProjectId] = useState(null);
   const [expandedTaskIds, setExpandedTaskIds] = useState(() => new Set());
   const [creatingTaskProjectId, setCreatingTaskProjectId] = useState(null);
@@ -1256,6 +1298,7 @@ export default function UserSpecificPT({ useLayout = false }) {
   const headerStickyRef = useRef(null);
   const pageFiltersCacheRef = useRef(null);
   const skipNextViewFilterResetRef = useRef(false);
+  const skipNextPageFiltersPersistRef = useRef(false);
   const didRestoreTableScrollRef = useRef(false);
 
   const isMyWork = scope === 'My Work';
@@ -1271,9 +1314,21 @@ export default function UserSpecificPT({ useLayout = false }) {
     setTaskOwnershipScope(next.taskOwnershipScope);
     setAssignedStatus(next.assignedStatus);
     setCreatedStatusFilter(next.createdStatusFilter);
+    setCompanyFilter(next.companyFilter);
+    setLineOfBusinessFilter(next.lineOfBusinessFilter);
+    setFunctionTypeFilter(next.functionTypeFilter);
+    setPeriodMode(next.periodMode);
+    setPeriodFrom(next.periodFrom);
+    setPeriodTo(next.periodTo);
+    setPeriodLabel(next.periodLabel);
+    setPeriodRanges(Array.isArray(next.periodRanges) ? next.periodRanges : []);
+    setPeriodParts(Array.isArray(next.periodParts) ? next.periodParts : []);
+    setPeriodFyStartYear(next.periodFyStartYear);
+    setSearch(next.search);
+    setInsightFocus(null);
   }, []);
 
-  // Restore table filters from Kissflow global `PageFilters` on mount / refresh.
+  // Restore table + common filters from Kissflow global `PageFilters` on mount / refresh.
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -1293,7 +1348,9 @@ export default function UserSpecificPT({ useLayout = false }) {
           saved.byView?.[viewKey] ||
           (saved.nameFilter != null ||
           saved.ownerOrProjectFilter != null ||
-          saved.assigneeFilter != null
+          saved.assigneeFilter != null ||
+          saved.companyFilter != null ||
+          saved.periodMode != null
             ? saved
             : null);
         // Prevent the scope/mode effect from wiping restored filters on first ready tick.
@@ -1309,7 +1366,9 @@ export default function UserSpecificPT({ useLayout = false }) {
     };
   }, [kfInstance, applyUsptTableFilters]);
 
-  // When switching My Work / My Team or Tasks / Projects, restore that view's saved filters.
+  // When switching My Work / My Team or Projects / Tasks / SubTasks, restore that view's
+  // saved filters (or defaults). Common rail filters are per-view so Projects company/period
+  // selections do not leave Tasks / SubTasks empty.
   useEffect(() => {
     if (!pageFiltersReady) return;
     if (skipNextViewFilterResetRef.current) {
@@ -1320,14 +1379,34 @@ export default function UserSpecificPT({ useLayout = false }) {
     }
     const viewKey = usptPageFiltersViewKey(scope, mode);
     const viewFilters = pageFiltersCacheRef.current?.byView?.[viewKey];
-    applyUsptTableFilters(viewFilters || USPT_DEFAULT_TABLE_FILTERS);
+    const nextFilters = pickUsptTableFilters(viewFilters || USPT_DEFAULT_TABLE_FILTERS);
+    // Avoid persisting the previous view's company/period onto this viewKey before state settles.
+    skipNextPageFiltersPersistRef.current = true;
+    const snapshot = {
+      v: 1,
+      scope,
+      mode,
+      byView: {
+        ...(pageFiltersCacheRef.current?.byView || {}),
+        [viewKey]: nextFilters,
+      },
+    };
+    pageFiltersCacheRef.current = snapshot;
+    if (kfInstance) {
+      void writeUsptPageFilters(kfInstance, snapshot);
+    }
+    applyUsptTableFilters(nextFilters);
     setSortKey('name');
     setSortDir('asc');
-  }, [scope, mode, pageFiltersReady, applyUsptTableFilters]);
+  }, [scope, mode, pageFiltersReady, applyUsptTableFilters, kfInstance]);
 
-  // Persist active table filters into Kissflow global `PageFilters`.
+  // Persist active table + common filters into Kissflow global `PageFilters` (per view).
   useEffect(() => {
     if (!pageFiltersReady || !kfInstance) return;
+    if (skipNextPageFiltersPersistRef.current) {
+      skipNextPageFiltersPersistRef.current = false;
+      return;
+    }
     const viewKey = usptPageFiltersViewKey(scope, mode);
     const viewFilters = pickUsptTableFilters({
       nameFilter,
@@ -1338,6 +1417,17 @@ export default function UserSpecificPT({ useLayout = false }) {
       taskOwnershipScope,
       assignedStatus,
       createdStatusFilter,
+      companyFilter,
+      lineOfBusinessFilter,
+      functionTypeFilter,
+      periodMode,
+      periodFrom,
+      periodTo,
+      periodLabel,
+      periodRanges,
+      periodParts,
+      periodFyStartYear,
+      search,
     });
     const snapshot = {
       v: 1,
@@ -1366,6 +1456,17 @@ export default function UserSpecificPT({ useLayout = false }) {
     taskOwnershipScope,
     assignedStatus,
     createdStatusFilter,
+    companyFilter,
+    lineOfBusinessFilter,
+    functionTypeFilter,
+    periodMode,
+    periodFrom,
+    periodTo,
+    periodLabel,
+    periodRanges,
+    periodParts,
+    periodFyStartYear,
+    search,
   ]);
 
   useEffect(() => {
@@ -1617,7 +1718,7 @@ export default function UserSpecificPT({ useLayout = false }) {
   const reloadProcessSubtasks = useCallback(async () => {
     if (!kfInstance) return;
     try {
-      const res = await fetchAllSubtasks(kfInstance);
+      const res = await fetchAllSubtasks(kfInstance, { enrichDetails: false });
       setApiProcessSubtasks((res?.items ?? []).map(mapProcessSubtaskItem));
     } catch (err) {
       console.warn('Reload process subtasks failed:', err?.message || err);
@@ -1771,7 +1872,7 @@ export default function UserSpecificPT({ useLayout = false }) {
           }
 
           try {
-            const subRes = await fetchAllSubtasks(kfInstance);
+            const subRes = await fetchAllSubtasks(kfInstance, { enrichDetails: false });
             if (!cancelled) {
               setApiProcessSubtasks((subRes?.items ?? []).map(mapProcessSubtaskItem));
             }
@@ -2879,8 +2980,10 @@ export default function UserSpecificPT({ useLayout = false }) {
           return compareNumber(a.pending, b.pending, dir);
         case 'health':
           return compareText(a.health, b.health, dir);
+        case 'createdAt':
+          return compareCreatedAt(a, b, dir, sortDir);
         default:
-          return 0;
+          return compareCreatedAt(a, b, -1, 'desc');
       }
     });
     return rows;
@@ -3043,8 +3146,8 @@ export default function UserSpecificPT({ useLayout = false }) {
   }, [tablePage, tableTotalPages]);
 
   const content = (
-    <div className="min-w-0 bg-gradient-to-b from-[#edf1ff] via-[#f6f8ff] to-[#f2ecff]">
-      <div className="min-w-0 p-2 pb-5 sm:p-4 sm:pb-6">
+    <div className="min-w-0 overflow-x-visible bg-gradient-to-b from-[#edf1ff] via-[#f6f8ff] to-[#f2ecff]">
+      <div className="min-w-0 overflow-x-visible px-3 pb-5 pt-2 sm:px-4 sm:pb-6 sm:pt-4">
         <div
           className="relative z-20 -mx-2 mb-3 min-w-0 overflow-visible border-b border-slate-200/60 bg-[#edf1ff]/95 px-3 py-2.5 sm:sticky sm:top-0 sm:z-30 sm:-mx-4 sm:mb-4 sm:bg-[#edf1ff]/90 sm:px-4 sm:py-2.5 sm:backdrop-blur-md"
           ref={headerStickyRef}
@@ -3188,11 +3291,11 @@ export default function UserSpecificPT({ useLayout = false }) {
                   value={companyFilter}
                   onChange={(e) => setCompanyFilter(e.target.value)}
                   leadingIcon="ri-building-2-line"
-                  aria-label="Filter by company"
+                  aria-label="Filter by companies"
                   className="min-w-0 w-full max-w-full sm:min-w-[9.5rem] sm:w-auto sm:shrink-0"
                   triggerClassName="text-xs py-1.5 h-auto min-h-[2.5rem] sm:min-h-[2rem] rounded-lg bg-slate-50/90 shadow-none"
                   options={[
-                    { value: '', label: 'Company' },
+                    { value: '', label: 'Companies' },
                     ...companyOptions.map((opt) => ({ value: opt, label: opt })),
                   ]}
                 />
@@ -3331,7 +3434,7 @@ export default function UserSpecificPT({ useLayout = false }) {
           </div>
         ) : null}
 
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
+        <div className="grid grid-cols-2 items-stretch gap-2.5 overflow-visible py-1.5 sm:grid-cols-5 sm:gap-3">
             {current.kpis.map((card, idx) => (
               <PremiumKPICard
               key={card.key || card.title}
@@ -3553,7 +3656,7 @@ export default function UserSpecificPT({ useLayout = false }) {
                 : ''
             }`}
           >
-            <div className="flex flex-col gap-2 border-b border-slate-200/80 px-3 py-3 sm:px-4 lg:flex-row lg:flex-wrap lg:items-center lg:justify-between">
+            <div className="flex flex-col gap-2 border-b border-slate-200/80 px-3 py-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between sm:px-4">
               <div className="flex min-w-0 flex-wrap items-center gap-2 sm:gap-3">
                 <div className="min-w-0">
                   <h3 className="text-sm font-bold text-slate-900">
@@ -3606,7 +3709,7 @@ export default function UserSpecificPT({ useLayout = false }) {
                 />
               </div>
             </div>
-            <div className="hidden overflow-x-auto lg:block">
+            <div className="hidden overflow-x-auto md:block">
               <table
                 className="w-full min-w-[720px]"
                 key={`table-${filterKey}`}
@@ -3878,7 +3981,7 @@ export default function UserSpecificPT({ useLayout = false }) {
               </table>
             </div>
 
-            <div className="space-y-2.5 p-2.5 sm:p-3 lg:hidden" key={`cards-${filterKey}`}>
+            <div className="space-y-2.5 p-2.5 sm:p-3 md:hidden" key={`cards-${filterKey}`}>
               {pageRows.length === 0 ? (
                 <p className="py-8 text-center text-xs text-slate-500">No {mode.toLowerCase()} found</p>
               ) : pageRows.map((row) => {

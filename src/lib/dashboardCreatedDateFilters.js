@@ -35,11 +35,30 @@ export function getCalendarYear(dateLike) {
 
 export function getRowCreatedDate(row) {
   return (
-    row?.createdAt ||
-    row?._created_at ||
     row?.raw?._created_at ||
+    row?._created_at ||
+    row?.createdDate ||
+    row?.createdAt ||
     row?.raw?.Created_at ||
     null
+  );
+}
+
+/** Newest created first. Prefer raw ISO `_created_at` over formatted display dates. */
+export function compareCreatedAt(a, b, dir = 1, sortDir = 'asc', getCreated = getRowCreatedDate) {
+  const ta = parseFilterDate(getCreated(a))?.getTime() ?? null;
+  const tb = parseFilterDate(getCreated(b))?.getTime() ?? null;
+  const aBad = ta == null;
+  const bBad = tb == null;
+  if (aBad && bBad) return 0;
+  if (aBad) return sortDir === 'asc' ? 1 : -1;
+  if (bBad) return sortDir === 'asc' ? -1 : 1;
+  return dir * (ta - tb);
+}
+
+export function sortByCreatedAtDesc(rows, getCreated = getRowCreatedDate) {
+  return [...(Array.isArray(rows) ? rows : [])].sort((a, b) =>
+    compareCreatedAt(a, b, -1, 'desc', getCreated),
   );
 }
 

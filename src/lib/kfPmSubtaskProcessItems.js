@@ -6,7 +6,11 @@
 import { getApiBase } from '../apiBase.js';
 import { buildPmProcessApiPaths } from './kfPmMyItemsPaths.js';
 import { SUBTASKS_ENTITY } from './pmMyItemsEntities.js';
-import { mapAdminSubtaskRow, enrichRawSubtaskRowsWithInstanceDetail } from './kfSubtaskTracker.js';
+import {
+  enrichRawSubtaskRowsWithInstanceDetail,
+  enrichSubtaskRowsWithParentProject,
+  mapAdminSubtaskRow,
+} from './kfSubtaskTracker.js';
 import { runWithConcurrency } from './kfRuntime.js';
 
 export const HUB_SUBTASK_PAGE_SIZE = 50;
@@ -93,8 +97,13 @@ function dedupeRawRows(rows) {
 
 async function mapRawSubtaskRows(kfInstance, rows) {
   const unique = dedupeRawRows(rows);
-  const enriched = await enrichRawSubtaskRowsWithInstanceDetail(kfInstance, unique, {
+  // myitems/pending lists omit Task_ID, Sub_task_Priority, and TStatus — those live on instance detail.
+  const withDetail = await enrichRawSubtaskRowsWithInstanceDetail(kfInstance, unique, {
     maxRows: HUB_SUBTASK_PAGE_SIZE,
+    concurrency: ACTIVITY_LIST_CONCURRENCY,
+  });
+  const enriched = await enrichSubtaskRowsWithParentProject(kfInstance, withDetail, {
+    concurrency: ACTIVITY_LIST_CONCURRENCY,
   });
   return enriched.map((row, idx) => mapAdminSubtaskRow(row, idx)).filter(Boolean);
 }

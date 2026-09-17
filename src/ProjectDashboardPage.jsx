@@ -38,11 +38,13 @@ import { kfGetJson, resolveKissflowAccountId } from './lib/kfRuntime.js';
 import {
   ensureTaskBusinessIdForCreate,
   fetchTaskTrackerData,
+  enrichTaskTrackerRows,
   resolveTaskBusinessIdFromRow,
   mapProcessSubtaskItem,
 } from './lib/kfTaskTracker.js';
 import { fetchMyTeamProjects } from './lib/kfMyTeamProjects.js';
 import { collectProjectExportRows, exportProjectAccordion } from './lib/exportProjectAccordion.js';
+import { compareCreatedAt, sortByCreatedAtDesc } from './lib/dashboardCreatedDateFilters.js';
 import {
   fetchMyTeamTasks,
   filterTasksByManagerEmail,
@@ -56,7 +58,6 @@ const DEFAULT_ACCOUNT_ID = 'AcCMptp3yqcn';
 const CASE_ID = 'Project_Management_A01';
 
 const getAccountId = (kfInstance) => resolveKissflowAccountId(kfInstance, DEFAULT_ACCOUNT_ID);
-const getFieldsPath = (accountId) => `/case/2/${accountId}/${CASE_ID}/fields`;
 /** Prefer case /list (honors page_size). View list/items caps ~21/page and needs walking. */
 const getProjectListPath = (accountId, pageNumber = 1, pageSize = 500) =>
   `/case/2/${accountId}/${CASE_ID}/list?page_number=${Math.max(1, Number(pageNumber) || 1)}&page_size=${Math.max(1, Math.min(1000, Number(pageSize) || 500))}`;
@@ -405,12 +406,22 @@ function mapItemsToProjectRows(items, detailById, activityById, availableFieldId
     const status = String(detail?.Status_1 ?? item?.Status_1 ?? '').trim() || 'Open';
     const dueDate = parseKfDate(detail?.End_Date || detail?.DueDate || item?.DueDate);
     const startDate = parseKfDate(detail?.Start_Date || detail?._start_date || item?._start_date || item?._created_at);
-    const timeline = Array.isArray(detail?.['Table::Project_Timeline_History']) ? detail['Table::Project_Timeline_History'] : [];
+    const timeline = Array.isArray(detail?.['Table::Project_Timeline_History'])
+      ? detail['Table::Project_Timeline_History']
+      : Array.isArray(detail?.Project_Timeline_History)
+        ? detail.Project_Timeline_History
+        : Array.isArray(item?.Project_Timeline_History)
+          ? item.Project_Timeline_History
+          : [];
     const { previousEndDate, revisedEndDate, sortedTimeline, revisedCount, hasRevision, plannedEndDate } = deriveTimelineEndDates(timeline);
     const effectiveEndDate = resolveEffectiveProjectEndDate(revisedEndDate, dueDate);
     const delayDays = computeProjectDelayDays(status, effectiveEndDate, now);
     const activities = Array.isArray(activityById[id]) ? activityById[id] : [];
-    const subtasks = Array.isArray(detail?.['Table::Project_Subtasks']) ? detail['Table::Project_Subtasks'] : [];
+    const subtasks = Array.isArray(detail?.['Table::Project_Subtasks'])
+      ? detail['Table::Project_Subtasks']
+      : Array.isArray(detail?.Project_Subtasks)
+        ? detail.Project_Subtasks
+        : [];
     const completedTasks = subtasks.filter((s) => mapSubtaskStatus(s?.Task_Status_1, s?.End_date_2) === 'Completed').length;
     const totalTasks = subtasks.length;
     // Interim progress from embedded rows; ProjectHealthTable recalculates from Task Tracker tasks.
@@ -554,56 +565,57 @@ function mapItemsToProjectRows(items, detailById, activityById, availableFieldId
         key: rev?._id || `${id}-REV-${revIdx + 1}`,
         };
       }),
-      activityHistory: activities.map((event, actIdx) => {
-        const change = event?._change_summary || {};
-        const changeKeys = Object.keys(change);
-        const firstKey = changeKeys[0];
-        const firstChange = firstKey ? change[firstKey] : null;
-        return {
-          key: event?._id || `${id}-ACT-${actIdx + 1}`,
-          date: fmtDate(parseKfDate(event?._created_at)),
-          eventType: event?._event_type || 'Updated',
-          field: event?._event_field || firstKey || 'Project',
-          by: event?._created_by?.Name || 'System',
-          oldValue: firstChange?.old_value?.Name || firstChange?.old_value || null,
-          newValue: firstChange?.current_value?.Name || firstChange?.current_value || null,
-          status: event?._status_name || null,
-        };
-      }),
+      activityHistory: mapProjectActivityHistory(id, activities),
     };
   });
 }
 
-/** Loads all project rows + flattened subtasks from the same Kissflow endpoints as the CTO dashboard. */
+function mapProjectActivityHistory(projectId, activities) {
+  return (Array.isArray(activities) ? activities : []).map((event, actIdx) => {
+    const change = event?._change_summary || {};
+    const changeKeys = Object.keys(change);
+    const firstKey = changeKeys[0];
+    const firstChange = firstKey ? change[firstKey] : null;
+    return {
+      key: event?._id || `${projectId}-ACT-${actIdx + 1}`,
+      date: fmtDate(parseKfDate(event?._created_at)),
+      eventType: event?._event_type || 'Updated',
+      field: event?._event_field || firstKey || 'Project',
+      by: event?._created_by?.Name || 'System',
+      oldValue: firstChange?.old_value?.Name || firstChange?.old_value || null,
+      newValue: firstChange?.current_value?.Name || firstChange?.current_value || null,
+      status: event?._status_name || null,
+    };
+  });
+}
+
+/** Case /list already includes form fields + Project_Timeline_History (no Table:: prefix). */
+function projectListItemAsDetail(item) {
+  if (!item || typeof item !== 'object') return {};
+  const timeline = item['Table::Project_Timeline_History'] ?? item.Project_Timeline_History;
+  const embedded = item['Table::Project_Subtasks'] ?? item.Project_Subtasks;
+  return {
+    ...item,
+    'Table::Project_Timeline_History': Array.isArray(timeline) ? timeline : [],
+    'Table::Project_Subtasks': Array.isArray(embedded) ? embedded : [],
+  };
+}
+
+/**
+ * Management dashboard load — list APIs only.
+ * Per-project detail + activity GETs used to add ~2N calls and dominate load time.
+ * Revised dates come from list timeline; activity history is fetched when a row is expanded.
+ */
 async function fetchProjectDashboardData(kfInstance) {
   const accountId = getAccountId(kfInstance);
-  const fieldsPath = getFieldsPath(accountId);
-
-  const fieldsResponse = await kfGetJson(kfInstance, fieldsPath);
-  const fieldIds = new Set((Array.isArray(fieldsResponse) ? fieldsResponse : []).map((f) => f?.Id).filter(Boolean));
   const listItems = await fetchAllProjectListItems(kfInstance, accountId);
-  const itemIds = listItems.map((x) => x?._item_id || x?._id).filter(Boolean);
-  const detailResults = await Promise.allSettled(
-    itemIds.map((id) => {
-      const path = `/case/2/${accountId}/${CASE_ID}/${id}`;
-      return kfGetJson(kfInstance, path);
-    }),
-  );
-  const activityResults = await Promise.allSettled(
-    itemIds.map((id) => {
-      const path = `/case/2/${accountId}/${CASE_ID}/${id}/activity`;
-      return kfGetJson(kfInstance, path);
-    }),
-  );
   const detailById = {};
-  const activityById = {};
-  detailResults.forEach((res, idx) => {
-    if (res.status === 'fulfilled' && res.value) detailById[itemIds[idx]] = res.value;
-  });
-  activityResults.forEach((res, idx) => {
-    if (res.status === 'fulfilled' && Array.isArray(res.value)) activityById[itemIds[idx]] = res.value;
-  });
-  const rows = mapItemsToProjectRows(listItems, detailById, activityById, fieldIds);
+  for (const item of listItems) {
+    const id = item?._item_id || item?._id;
+    if (!id) continue;
+    detailById[id] = projectListItemAsDetail(item);
+  }
+  const rows = mapItemsToProjectRows(listItems, detailById, {}, null);
   const subtasks = rows.flatMap((r) => r.subtasks || []);
   return { rows, subtasks };
 }
@@ -1107,6 +1119,8 @@ function DashboardDimensionFilters({
   /** Hides Company / Business Functions / Function Type (UserHub tasks). */
   hideCompanyFunctionFilters = false,
   periodCategoryCounts = null,
+  /** Keep the inline filter rail at md+ so 150%+ zoom does not drop to the mobile sheet. */
+  inlineFromMd = true,
 }) {
   const [sheetOpen, setSheetOpen] = useState(false);
   const [draft, setDraft] = useState(filters);
@@ -1238,10 +1252,15 @@ function DashboardDimensionFilters({
     });
   }
 
+  const mobileRailClass = inlineFromMd ? 'md:hidden' : 'lg:hidden';
+  const desktopRailClass = inlineFromMd
+    ? 'hidden md:flex md:flex-wrap md:justify-end md:overflow-visible'
+    : 'hidden lg:flex lg:flex-wrap lg:justify-end lg:overflow-visible';
+
   return (
-    <div className="flex w-full flex-col gap-1.5 lg:w-auto lg:items-end">
+    <div className={`flex w-full flex-col gap-1.5 ${inlineFromMd ? 'md:w-auto md:items-end' : 'lg:w-auto lg:items-end'}`}>
       {/* Mobile: compact Filters button + sheet */}
-      <div className="flex w-full flex-col gap-2 lg:hidden">
+      <div className={`flex w-full flex-col gap-2 ${mobileRailClass}`}>
         {prefix ? <div className="w-full">{prefix}</div> : null}
         <div className="flex w-full gap-2">
           <MobileFiltersButton count={activeCount} onClick={openSheet} />
@@ -1258,7 +1277,7 @@ function DashboardDimensionFilters({
       </div>
 
       {/* Desktop: original horizontal / wrap rail — unchanged */}
-      <div className="hidden w-full snap-x snap-mandatory items-end gap-2 overflow-x-auto pb-0.5 [-ms-overflow-style:none] [scrollbar-width:none] lg:flex lg:flex-wrap lg:justify-end lg:overflow-visible [&::-webkit-scrollbar]:hidden">
+      <div className={`w-full snap-x snap-mandatory items-end gap-2 overflow-x-auto pb-0.5 [-ms-overflow-style:none] [scrollbar-width:none] ${desktopRailClass} [&::-webkit-scrollbar]:hidden`}>
         {prefix}
         {fields.map(({ key, label, icon, allLabel }) => (
           <label key={key} className="flex min-w-[10.5rem] shrink-0 snap-start flex-col gap-1">
@@ -1320,7 +1339,7 @@ function DashboardDimensionFilters({
       </div>
 
       {hasActiveFilters ? (
-        <p className="hidden text-center text-[10px] font-medium text-slate-500 lg:block lg:text-right">
+        <p className={`hidden text-center text-[10px] font-medium text-slate-500 ${inlineFromMd ? 'md:block md:text-right' : 'lg:block lg:text-right'}`}>
           Portfolio filters applied across all sections · Period uses Created / Closed / Need action
         </p>
       ) : null}
@@ -1407,9 +1426,9 @@ function DashboardDimensionFilters({
   );
 }
 
-/** Loads task tracker items from Project_Sub_Task_A01 — enrich for Table::Task_History / Revised. */
+/** List first (fast). Revised/history enrich runs after first paint. */
 async function fetchSubtaskTrackerData(kfInstance) {
-  return fetchTaskTrackerData(kfInstance, { enrichDetails: true });
+  return fetchTaskTrackerData(kfInstance, { enrichDetails: false });
 }
 
 /** Normalize Kissflow user field vs display name (assignee / owner). */
@@ -1889,7 +1908,7 @@ function PremiumKPICard({ title, value, subtitle, trend, icon, theme, index, onC
 
 /** Shared grid + min height so Insight and Health Monitor cards align in size only */
 const DASHBOARD_CARD_GRID =
-  'grid grid-cols-2 items-stretch gap-2.5 sm:gap-4 md:gap-5 xl:grid-cols-4';
+  'grid grid-cols-2 items-stretch gap-2.5 overflow-visible py-1.5 sm:grid-cols-4 sm:gap-3 md:gap-4 xl:gap-5';
 const DASHBOARD_CARD_MIN_H = 'min-h-[112px] lg:min-h-[168px]';
 
 function AnimatedBar({ widthPct, color, trackClass, delay, subtle = false }) {
@@ -2035,7 +2054,7 @@ function HealthMonitorCard({
 const KPI_FOCUS = {
   'total-projects': { section: 'health', projectStatus: 'all', label: 'All projects' },
   'active-projects': { section: 'health', projectStatus: '__active__', label: 'Active projects' },
-  'completed-projects': { section: 'health', projectStatus: 'Completed', label: 'Completed projects' },
+  'completed-projects': { section: 'health', projectStatus: '__closed__', label: 'Completed projects' },
   'delayed-projects': { section: 'delay', delayType: 'delayed', label: 'Delayed projects' },
   'total-tasks': { section: 'subtasks', taskStatus: 'all', label: 'All tasks' },
   'open-tasks': { section: 'subtasks', taskStatus: '__open__', label: 'Open tasks' },
@@ -2503,8 +2522,8 @@ function ProjectHealthTable({ data, allTasks, allProcessSubtasks, onOpenTaskPopu
   const [ownerFilter, setOwnerFilter] = useState('all');
   const [nameFilter, setNameFilter] = useState('all');
   const [search, setSearch] = useState('');
-  const [sortKey, setSortKey] = useState('name');
-  const [sortDir, setSortDir] = useState('asc');
+  const [sortKey, setSortKey] = useState('createdAt');
+  const [sortDir, setSortDir] = useState('desc');
   const [page, setPage] = useState(1);
   const [expandedId, setExpandedId] = useState(null);
 
@@ -2568,6 +2587,8 @@ function ProjectHealthTable({ data, allTasks, allProcessSubtasks, onOpenTaskPopu
         if (ragFilter !== 'all' && row.rag !== ragFilter) return false;
         if (statusFilter === '__active__') {
           if (isProjectClosed(row.status)) return false;
+        } else if (statusFilter === '__closed__' || statusFilter === 'Completed') {
+          if (!isProjectClosed(row.status)) return false;
         } else if (statusFilter !== 'all' && row.status !== statusFilter) {
           return false;
         }
@@ -2617,8 +2638,10 @@ function ProjectHealthTable({ data, allTasks, allProcessSubtasks, onOpenTaskPopu
           return dir * (ragRank(a.rag) - ragRank(b.rag));
         case 'status':
           return dir * String(a.status || '').localeCompare(String(b.status || ''), undefined, { sensitivity: 'base' });
+        case 'createdAt':
+          return compareCreatedAt(a, b, dir, sortDir);
         default:
-          return 0;
+          return compareCreatedAt(a, b, -1, 'desc');
       }
     });
     return copy;
@@ -2695,7 +2718,10 @@ function ProjectHealthTable({ data, allTasks, allProcessSubtasks, onOpenTaskPopu
       filterOptions: [
         { value: 'all', label: 'All Status' },
         { value: '__active__', label: 'Active (not completed)' },
-        ...statuses.map((s) => ({ value: s, label: s })),
+        { value: '__closed__', label: 'Closed' },
+        ...statuses
+          .filter((s) => s && s !== '__active__' && s !== '__closed__')
+          .map((s) => ({ value: s, label: s })),
       ],
     },
   };
@@ -2745,7 +2771,12 @@ function ProjectHealthTable({ data, allTasks, allProcessSubtasks, onOpenTaskPopu
     statusFilter !== 'all'
       ? {
           key: 'status',
-          label: statusFilter === '__active__' ? 'Active' : statusFilter,
+          label:
+            statusFilter === '__active__'
+              ? 'Active'
+              : statusFilter === '__closed__' || statusFilter === 'Completed'
+                ? 'Closed'
+                : statusFilter,
           onRemove: () => setStatusFilter('all'),
         }
       : null,
@@ -2767,7 +2798,7 @@ function ProjectHealthTable({ data, allTasks, allProcessSubtasks, onOpenTaskPopu
     <div
       className="overflow-hidden rounded-2xl border border-white/80 bg-white/95 shadow-lg shadow-slate-200/40 backdrop-blur-sm lg:rounded-3xl"
     >
-      <div className="flex flex-col gap-3 border-b border-slate-100 bg-gradient-to-r from-white to-blue-50/40 px-3 py-3 sm:px-5 sm:py-4 lg:flex-row lg:items-center">
+      <div className="flex flex-col gap-3 border-b border-slate-100 bg-gradient-to-r from-white to-blue-50/40 px-3 py-3 sm:flex-row sm:items-center sm:px-5 sm:py-4">
         <div className="text-left">
           <h3 className="text-sm font-semibold text-slate-800 sm:text-base">Project Health Overview</h3>
           <p className="mt-0.5 text-[11px] text-slate-500 sm:text-xs">
@@ -2791,7 +2822,7 @@ function ProjectHealthTable({ data, allTasks, allProcessSubtasks, onOpenTaskPopu
           </div>
 
           {/* Mobile Filters + Sort */}
-          <div className="flex w-full gap-2 lg:hidden">
+          <div className="flex w-full gap-2 md:hidden">
             <MobileFiltersButton count={projectFilterCount} onClick={openProjectFilterSheet} />
             <div className="flex min-w-0 flex-[1.2] items-center gap-1.5">
               <PtSelect
@@ -2799,7 +2830,10 @@ function ProjectHealthTable({ data, allTasks, allProcessSubtasks, onOpenTaskPopu
                 onChange={(e) => setSortKey(e.target.value)}
                 className="min-w-0 flex-1"
                 aria-label="Sort by"
-                options={COLUMN_META.map((col) => ({ value: col.key, label: col.label }))}
+                options={[
+                  { value: 'createdAt', label: 'Created' },
+                  ...COLUMN_META.map((col) => ({ value: col.key, label: col.label })),
+                ]}
               />
               <button
                 type="button"
@@ -2811,12 +2845,12 @@ function ProjectHealthTable({ data, allTasks, allProcessSubtasks, onOpenTaskPopu
               </button>
             </div>
           </div>
-          <div className="lg:hidden">
+          <div className="md:hidden">
             <MobileActiveFilterChips chips={projectFilterChips} />
           </div>
 
           {/* Desktop filter rail */}
-          <div className="hidden snap-x snap-mandatory gap-2 overflow-x-auto pb-1 [-ms-overflow-style:none] [scrollbar-width:none] sm:flex-wrap sm:overflow-visible sm:pb-0 lg:flex lg:justify-end [&::-webkit-scrollbar]:hidden">
+          <div className="hidden snap-x snap-mandatory gap-2 overflow-x-auto pb-1 [-ms-overflow-style:none] [scrollbar-width:none] sm:flex-wrap sm:overflow-visible sm:pb-0 md:flex md:justify-end [&::-webkit-scrollbar]:hidden">
             <PtSelect
               value={ragFilter}
               onChange={(e) => setRagFilter(e.target.value)}
@@ -2837,7 +2871,10 @@ function ProjectHealthTable({ data, allTasks, allProcessSubtasks, onOpenTaskPopu
               options={[
                 { value: 'all', label: 'All Status' },
                 { value: '__active__', label: 'Active (not completed)' },
-                ...statuses.map((s) => ({ value: s, label: s })),
+                { value: '__closed__', label: 'Closed' },
+                ...statuses
+                  .filter((s) => s && s !== '__active__' && s !== '__closed__')
+                  .map((s) => ({ value: s, label: s })),
               ]}
             />
             <PtSelect
@@ -2852,7 +2889,7 @@ function ProjectHealthTable({ data, allTasks, allProcessSubtasks, onOpenTaskPopu
             />
             {headerActions}
           </div>
-          {headerActions ? <div className="flex w-full lg:hidden">{headerActions}</div> : null}
+          {headerActions ? <div className="flex w-full md:hidden">{headerActions}</div> : null}
         </div>
       </div>
 
@@ -2909,7 +2946,7 @@ function ProjectHealthTable({ data, allTasks, allProcessSubtasks, onOpenTaskPopu
         </MobileFilterField>
       </MobileFilterSheet>
 
-      <div className="hidden overflow-x-auto lg:block">
+      <div className="hidden overflow-x-auto md:block">
         <table className="w-full">
           <thead>
             <tr className="border-b border-slate-100 bg-slate-50/70">
@@ -3046,7 +3083,7 @@ function ProjectHealthTable({ data, allTasks, allProcessSubtasks, onOpenTaskPopu
         </table>
       </div>
 
-      <div className="space-y-2.5 p-3 sm:space-y-3 sm:p-3 lg:hidden">
+      <div className="space-y-2.5 p-3 sm:space-y-3 sm:p-3 md:hidden">
         {filtered.length === 0 && (
           <div className="rounded-xl border border-slate-200 bg-slate-50 p-5 text-center text-xs text-slate-500 sm:text-sm">
             No projects found
@@ -3208,7 +3245,7 @@ function getTasksLinkedToProject(project, allTasks) {
   const pname = String(project?.name ?? '').trim();
   if (!pid && !pref && !pname) return [];
 
-  return rows.filter((t) => {
+  const linked = rows.filter((t) => {
     const tPid = String(
       t?.projectId ??
         t?.raw?.Project_ID?._item_id ??
@@ -3226,6 +3263,7 @@ function getTasksLinkedToProject(project, allTasks) {
       || (pref && tPref && tPref === pref)
       || (pname && tName && tName === pname);
   });
+  return sortByCreatedAtDesc(linked);
 }
 
 /** All tasks linked to any project in the list (deduped). */
@@ -4118,8 +4156,8 @@ function SubtaskTable({
   const [projectFilter, setProjectFilter] = useState('all');
   const [taskNameFilter, setTaskNameFilter] = useState('all');
   const [assigneeFilter, setAssigneeFilter] = useState('all');
-  const [sortKey, setSortKey] = useState('taskName');
-  const [sortDir, setSortDir] = useState('asc');
+  const [sortKey, setSortKey] = useState('createdAt');
+  const [sortDir, setSortDir] = useState('desc');
   const [page, setPage] = useState(1);
   const [expandedTaskIds, setExpandedTaskIds] = useState(() => new Set());
 
@@ -4250,8 +4288,10 @@ function SubtaskTable({
           return compareNumber(a.delayDays, b.delayDays, dir);
         case 'status':
           return compareText(a.status, b.status, dir);
+        case 'createdAt':
+          return compareCreatedAt(a, b, dir, sortDir);
         default:
-          return 0;
+          return compareCreatedAt(a, b, -1, 'desc');
       }
     });
     return copy;
@@ -4374,7 +4414,7 @@ function SubtaskTable({
     <div
       className={`overflow-hidden rounded-2xl ${compact ? 'border border-slate-200 bg-white shadow-sm' : 'border border-white/80 bg-white/95 shadow-lg shadow-slate-200/40 backdrop-blur-sm'} lg:rounded-3xl`}
     >
-      <div className={`flex flex-col gap-3 border-b border-slate-100 bg-gradient-to-r from-white to-indigo-50/40 px-3 py-3 sm:px-5 sm:py-4 lg:flex-row lg:items-center ${compact ? 'sm:py-3' : ''}`}>
+      <div className={`flex flex-col gap-3 border-b border-slate-100 bg-gradient-to-r from-white to-indigo-50/40 px-3 py-3 sm:flex-row sm:items-center sm:px-5 sm:py-4 ${compact ? 'sm:py-3' : ''}`}>
         {!hideTitle ? (
           <div className="text-left">
             <h3 className="text-sm font-semibold text-slate-800 sm:text-base">Task Tracker</h3>
@@ -4394,9 +4434,9 @@ function SubtaskTable({
           </div>
         )}
 
-        <div className="flex w-full min-w-0 flex-col gap-2 lg:ml-auto lg:w-auto lg:flex-row lg:items-center lg:gap-2">
+        <div className="flex w-full min-w-0 flex-col gap-2 md:ml-auto md:w-auto md:flex-row md:items-center md:gap-2">
           <div className="flex min-w-0 items-center gap-2">
-            <div className={`relative min-w-0 flex-1 ${compact ? 'lg:w-40' : 'lg:w-44'} lg:flex-none`}>
+            <div className={`relative min-w-0 flex-1 ${compact ? 'md:w-40' : 'md:w-44'} md:flex-none`}>
               <i className="ri-search-line absolute left-2.5 top-1/2 -translate-y-1/2 text-sm text-[#7F8C8D]" />
               <input
                 type="text"
@@ -4406,7 +4446,7 @@ function SubtaskTable({
                 className={`h-9 w-full rounded-xl border border-slate-200 bg-white py-0 pl-8 pr-3 text-[11px] outline-none focus:border-indigo-500 sm:text-xs ${compact ? '' : 'lg:rounded-2xl'}`}
               />
             </div>
-            <div className="flex shrink-0 gap-2 lg:hidden">
+            <div className="flex shrink-0 gap-2 md:hidden">
               <MobileFiltersButton count={taskFilterCount} onClick={openTaskFilterSheet} />
               {typeof onRefresh === 'function' ? (
                 <button
@@ -4422,12 +4462,12 @@ function SubtaskTable({
               ) : null}
             </div>
           </div>
-          <div className="lg:hidden">
+          <div className="md:hidden">
             <MobileActiveFilterChips chips={taskChips} />
           </div>
-          {headerActions ? <div className="flex w-full items-start lg:hidden">{headerActions}</div> : null}
+          {headerActions ? <div className="flex w-full items-start md:hidden">{headerActions}</div> : null}
 
-          <div className="hidden shrink-0 items-center gap-1.5 lg:flex">
+          <div className="hidden shrink-0 items-center gap-1.5 md:flex">
             <PtSelect
               value={statusFilter}
               onChange={(e) => setStatusFilter(e.target.value)}
@@ -4499,7 +4539,7 @@ function SubtaskTable({
         </MobileFilterField>
       </MobileFilterSheet>
 
-      <div className="hidden overflow-x-auto lg:block">
+      <div className="hidden overflow-x-auto md:block">
         <table className="w-full">
           <thead>
             <tr className="border-b border-slate-100 bg-slate-50/70">
@@ -4688,7 +4728,7 @@ function SubtaskTable({
         </table>
       </div>
 
-      <div className="space-y-2 p-3 lg:hidden">
+      <div className="space-y-2 p-3 md:hidden">
         {pageRows.length === 0 && (
           <div className="rounded-xl border border-slate-200 bg-slate-50 p-5 text-center text-xs text-slate-500">No tasks found</div>
         )}
@@ -4986,8 +5026,8 @@ function DelayRevisionSection({ data, onRowClick, insightFilter = null }) {
     <div
       className="overflow-hidden rounded-2xl border border-slate-200/70 bg-white shadow-sm lg:rounded-3xl lg:border-white/80 lg:bg-white/95 lg:shadow-lg lg:shadow-slate-200/40 lg:backdrop-blur-sm"
     >
-      <div className="flex flex-col gap-2 border-b border-slate-100 bg-gradient-to-r from-rose-50/60 to-white px-3 py-3 sm:px-5 sm:py-4 lg:flex-row lg:items-center lg:justify-between">
-        <div className="text-center lg:text-left">
+      <div className="flex flex-col gap-2 border-b border-slate-100 bg-gradient-to-r from-rose-50/60 to-white px-3 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-5 sm:py-4">
+        <div className="text-left">
           <h3 className="text-sm font-semibold text-slate-800 sm:text-base">Delay &amp; Revision Tracker</h3>
           <p className="mt-0.5 text-[11px] text-slate-500 sm:text-xs">
             {total} affected
@@ -5007,18 +5047,18 @@ function DelayRevisionSection({ data, onRowClick, insightFilter = null }) {
             />
           </div>
 
-          <div className="flex w-full gap-2 lg:hidden">
+          <div className="flex w-full gap-2 md:hidden">
             <MobileFiltersButton count={delayFilterCount} onClick={openDelayFilterSheet} />
             <span className="inline-flex min-h-[40px] shrink-0 items-center justify-center gap-1.5 rounded-xl bg-red-50 px-3 text-[11px] font-semibold text-[#E53935]">
               <i className="ri-alarm-warning-line" aria-hidden />
               {total}
             </span>
           </div>
-          <div className="lg:hidden">
+          <div className="md:hidden">
             <MobileActiveFilterChips chips={delayChips} />
           </div>
 
-          <div className="hidden snap-x snap-mandatory gap-2 overflow-x-auto pb-1 [-ms-overflow-style:none] [scrollbar-width:none] sm:flex-wrap sm:overflow-visible sm:pb-0 lg:flex lg:justify-end [&::-webkit-scrollbar]:hidden">
+          <div className="hidden snap-x snap-mandatory gap-2 overflow-x-auto pb-1 [-ms-overflow-style:none] [scrollbar-width:none] sm:flex-wrap sm:overflow-visible sm:pb-0 md:flex md:justify-end [&::-webkit-scrollbar]:hidden">
             <PtSelect
               value={ragFilter}
               onChange={(e) => setRagFilter(e.target.value)}
@@ -5077,7 +5117,7 @@ function DelayRevisionSection({ data, onRowClick, insightFilter = null }) {
         </MobileFilterField>
       </MobileFilterSheet>
 
-      <div className="hidden overflow-x-auto lg:block">
+      <div className="hidden overflow-x-auto md:block">
         <table className="w-full">
           <thead>
             <tr className="border-b border-slate-100 bg-slate-50/70">
@@ -5155,7 +5195,7 @@ function DelayRevisionSection({ data, onRowClick, insightFilter = null }) {
         </table>
       </div>
 
-      <div className="space-y-2.5 p-2.5 sm:space-y-3 sm:p-3 lg:hidden">
+      <div className="space-y-2.5 p-2.5 sm:space-y-3 sm:p-3 md:hidden">
         {pageRows.length === 0 && (
           <div className="rounded-xl border border-slate-200 bg-slate-50 p-5 text-center text-xs text-slate-500">No delayed projects</div>
         )}
@@ -5222,16 +5262,46 @@ function ProjectDrillDownPanel({
   onRefreshTasks,
   refreshingTasks = false,
 }) {
+  const { kf: kfFromContext } = useContext(KissflowSDKContext);
   const [activeTab, setActiveTab] = useState('subtasks');
   const [creatingTask, setCreatingTask] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [activityHistory, setActivityHistory] = useState(() =>
+    Array.isArray(project?.activityHistory) ? project.activityHistory : [],
+  );
   const exportMenuRef = useRef(null);
 
   useEffect(() => {
     setActiveTab('subtasks');
     setExportOpen(false);
+    setActivityHistory(Array.isArray(project?.activityHistory) ? project.activityHistory : []);
   }, [project?.id]);
+
+  useEffect(() => {
+    const existing = Array.isArray(project?.activityHistory) ? project.activityHistory : [];
+    if (existing.length > 0) return undefined;
+    const sdk =
+      kfFromContext ??
+      (typeof kf !== 'undefined' ? kf : null) ??
+      (typeof window !== 'undefined' ? window.kf : null);
+    const accountId = getAccountId(sdk);
+    const id = String(project?.id || '').trim();
+    if (!id || !sdk?.api || !accountId) return undefined;
+    let cancelled = false;
+    kfGetJson(sdk, `/case/2/${accountId}/${CASE_ID}/${encodeURIComponent(id)}/activity`)
+      .then((acts) => {
+        if (!cancelled && Array.isArray(acts)) {
+          setActivityHistory(mapProjectActivityHistory(id, acts));
+        }
+      })
+      .catch((error) => {
+        console.warn('Project activity fetch failed:', error?.message || error);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [kfFromContext, project?.id]);
 
   useEffect(() => {
     if (!exportOpen) return undefined;
@@ -5271,6 +5341,14 @@ function ProjectDrillDownPanel({
         await exportProjectAccordion(kind, bundle);
       } catch (error) {
         console.warn('Project accordion export failed:', error);
+        const message =
+          error?.message ||
+          (kind === 'png'
+            ? 'PNG export failed. Try Excel (CSV) for large projects.'
+            : 'Export failed. Please try again.');
+        if (typeof window !== 'undefined' && typeof window.alert === 'function') {
+          window.alert(message);
+        }
       } finally {
         setExporting(false);
       }
@@ -5305,6 +5383,7 @@ function ProjectDrillDownPanel({
           >
             <i className="ri-image-line text-base text-[#1E88E5]" aria-hidden />
             PNG image
+            <span className="ml-auto text-[10px] font-medium text-slate-400">multi-page if large</span>
           </button>
           <button
             type="button"
@@ -5314,6 +5393,7 @@ function ProjectDrillDownPanel({
           >
             <i className="ri-file-excel-2-line text-base text-[#43A047]" aria-hidden />
             Excel (CSV)
+            <span className="ml-auto text-[10px] font-medium text-slate-400">best for 500+</span>
           </button>
         </div>
       ) : null}
@@ -5334,7 +5414,7 @@ function ProjectDrillDownPanel({
   return (
     <div className="flex min-h-0 flex-col bg-transparent">
       {/* Mobile segmented control */}
-      <div className="shrink-0 p-3 lg:hidden">
+      <div className="shrink-0 p-3 md:hidden">
         <div className="grid grid-cols-2 gap-0.5 rounded-xl border border-slate-200 bg-white p-0.5">
           {tabs.map((tab) => (
             <button
@@ -5355,7 +5435,7 @@ function ProjectDrillDownPanel({
       </div>
 
       {/* Desktop underline tabs */}
-      <div className="hidden shrink-0 gap-1 overflow-x-auto border-b border-gray-100 bg-white px-3 [-ms-overflow-style:none] [scrollbar-width:none] sm:px-4 lg:flex [&::-webkit-scrollbar]:hidden">
+      <div className="hidden shrink-0 gap-1 overflow-x-auto border-b border-gray-100 bg-white px-3 [-ms-overflow-style:none] [scrollbar-width:none] sm:px-4 md:flex [&::-webkit-scrollbar]:hidden">
         {tabs.map((tab) => (
           <button
             key={tab.key}
@@ -5418,7 +5498,7 @@ function ProjectDrillDownPanel({
 
         {activeTab === 'revisions' && (
           <div>
-            {(!p.hasRevision || revisionHistory.length <= 1) && (!p.activityHistory || p.activityHistory.length === 0) ? (
+            {(!p.hasRevision || revisionHistory.length <= 1) && activityHistory.length === 0 ? (
               <div className="flex flex-col items-center gap-2 py-10">
                 <i className="ri-history-line text-3xl text-gray-300" />
                 <p className="text-sm text-[#7F8C8D]">No revisions recorded</p>
@@ -5458,11 +5538,11 @@ function ProjectDrillDownPanel({
               </div>
             )}
 
-            {Array.isArray(p.activityHistory) && p.activityHistory.length > 0 ? (
+            {activityHistory.length > 0 ? (
               <div className="mt-6">
                 <h4 className="mb-3 text-sm font-semibold text-[#2C3E50]">Activity History</h4>
                 <div className="space-y-3">
-                  {p.activityHistory.map((act) => (
+                  {activityHistory.map((act) => (
                     <div key={act.key} className="rounded-xl border border-gray-100 bg-white p-3">
                       <div className="flex items-center justify-between gap-3">
                         <p className="text-sm font-medium text-[#2C3E50]">
@@ -5612,7 +5692,7 @@ function DashboardPagePremium({
       setApiProjectData([]);
       setApiSubtaskData([]);
       try {
-        const processSubtasksRes = await fetchAllSubtasks(kfInstance);
+        const processSubtasksRes = await fetchAllSubtasks(kfInstance, { enrichDetails: false });
         setApiProcessSubtaskData((processSubtasksRes?.items ?? []).map(mapProcessSubtaskItem));
       } catch (error) {
         console.warn('Hub process subtasks fetch failed:', error?.message || error);
@@ -5624,7 +5704,7 @@ function DashboardPagePremium({
     const [projectsRes, subtasksRes, processSubtasksRes] = await Promise.allSettled([
       fetchProjectDashboardData(kfInstance),
       fetchSubtaskTrackerData(kfInstance),
-      fetchAllSubtasks(kfInstance),
+      fetchAllSubtasks(kfInstance, { enrichDetails: false }),
     ]);
 
     const rows = projectsRes.status === 'fulfilled' ? (projectsRes.value?.rows ?? []) : [];
@@ -5640,6 +5720,17 @@ function DashboardPagePremium({
     setApiProjectData(rows);
     setApiSubtaskData(subtasks);
     setApiProcessSubtaskData(processSubtasks);
+
+    // Revised badges need per-task history; fill in after the portfolio is on screen.
+    if (subtasks.length > 0) {
+      void enrichTaskTrackerRows(kfInstance, subtasks)
+        .then((enriched) => {
+          if (Array.isArray(enriched) && enriched.length > 0) setApiSubtaskData(enriched);
+        })
+        .catch((error) => {
+          console.warn('Task revision enrich failed:', error?.message || error);
+        });
+    }
   }, [kfInstance, lightHubTasksMode]);
 
   const handleOpenTaskDetail = useCallback((row) => {
@@ -6362,7 +6453,7 @@ function DashboardPagePremium({
     trendDelayedProjects: `${Math.round((delayedProjects / Math.max(totalProjects, 1)) * 100)}% at risk`,
   };
   const content = (
-    <div className={embeddedInHub ? 'min-w-0 overflow-x-clip' : 'overflow-x-clip bg-gradient-to-b from-[#edf1ff] via-[#f6f8ff] to-[#f2ecff]'}>
+    <div className={embeddedInHub ? 'min-w-0 overflow-x-visible' : 'overflow-x-visible bg-gradient-to-b from-[#edf1ff] via-[#f6f8ff] to-[#f2ecff]'}>
       <div className={embeddedInHub ? 'min-w-0' : 'p-3 pb-6 sm:p-6'}>
         {!hideWelcomeHeader ? (
         <motion.header
@@ -6377,8 +6468,8 @@ function DashboardPagePremium({
               : { duration: 0.2 }
           }
         >
-          <div className="mx-auto flex max-w-[1800px] flex-col gap-2.5 lg:flex-row lg:items-center lg:justify-between lg:gap-6">
-            <div className="min-w-0 shrink text-center lg:w-auto lg:py-0.5 lg:text-left">
+          <div className="mx-auto flex max-w-[1800px] flex-col gap-2.5 min-[720px]:flex-row min-[720px]:items-center min-[720px]:justify-between min-[720px]:gap-6">
+            <div className="min-w-0 shrink text-center min-[720px]:w-auto min-[720px]:py-0.5 min-[720px]:text-left">
               <h1 className="text-base font-semibold leading-snug tracking-tight text-slate-800 sm:text-2xl md:text-3xl">
                 {getGreetingText()}, <span className="font-semibold text-slate-900">{userName}</span>
               </h1>
@@ -6403,13 +6494,14 @@ function DashboardPagePremium({
                 )}
               </p>
             </div>
-            <div className="flex min-w-0 flex-1 flex-col items-stretch gap-2 lg:items-end">
+            <div className="flex min-w-0 flex-1 flex-col items-stretch gap-2 min-[720px]:items-end">
               <DashboardDimensionFilters
                 filters={dimensionFilters}
                 options={filterOptions}
                 onChange={handleDimensionFilterChange}
                 onClear={handleClearDimensionFilters}
                 hasActiveFilters={hasActiveFilters}
+                inlineFromMd
                 {...dimensionFilterExtraProps}
                 prefix={
                   <>
@@ -6545,15 +6637,16 @@ function DashboardPagePremium({
         </motion.header>
         ) : hubWelcome ? (
           <div ref={headerRef} className="mb-4 sm:mb-5">
-            <div className="mx-auto flex max-w-[1800px] flex-col gap-2.5 lg:flex-row lg:items-center lg:justify-between lg:gap-4">
+            <div className="mx-auto flex max-w-[1800px] flex-col gap-2.5 min-[720px]:flex-row min-[720px]:items-center min-[720px]:justify-between min-[720px]:gap-4">
               <UserHubWelcome {...hubWelcome} className="mb-0 shrink-0" />
-              <div className="flex min-w-0 flex-1 flex-col items-stretch gap-2 lg:items-end">
+              <div className="flex min-w-0 flex-1 flex-col items-stretch gap-2 min-[720px]:items-end">
                 <DashboardDimensionFilters
                   filters={dimensionFilters}
                   options={filterOptions}
                   onChange={handleDimensionFilterChange}
                   onClear={handleClearDimensionFilters}
                   hasActiveFilters={hasActiveFilters}
+                  inlineFromMd={embeddedInHub}
                   {...dimensionFilterExtraProps}
                   prefix={toolbarPrefix}
                   suffix={portfolioUserFilterControl}
@@ -6588,7 +6681,9 @@ function DashboardPagePremium({
             <div className="mb-1.5 px-0.5 sm:mb-3">
               <h2 className="text-xs font-bold tracking-wide text-slate-700 sm:text-base">Project Insights</h2>
             </div>
-            <KPISection metrics={kpiMetrics} onKpiClick={handleKpiClick} activeKey={insightFocus?.key} group="projects" />
+            <div className="overflow-visible">
+              <KPISection metrics={kpiMetrics} onKpiClick={handleKpiClick} activeKey={insightFocus?.key} group="projects" />
+            </div>
           </motion.section>
           )}
 
@@ -6604,11 +6699,13 @@ function DashboardPagePremium({
             <div className="mb-1.5 px-0.5 sm:mb-3">
               <h2 className="text-xs font-bold tracking-wide text-slate-700 sm:text-base">Project Health Monitor</h2>
             </div>
-            <RAGSummaryBar
-              data={filteredProjectData}
-              onCardClick={handleKpiClick}
-              activeKey={insightFocus?.key}
-            />
+            <div className="overflow-visible">
+              <RAGSummaryBar
+                data={filteredProjectData}
+                onCardClick={handleKpiClick}
+                activeKey={insightFocus?.key}
+              />
+            </div>
           </motion.section>
           )}
 

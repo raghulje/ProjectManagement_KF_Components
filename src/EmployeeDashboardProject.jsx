@@ -14,7 +14,6 @@ import {
 import { fetchEmployeeTaskTrackerData } from './lib/kfTaskTracker.js';
 import {
   fetchProjectListSummary,
-  enrichProjectRows,
   personMatches,
   resolveRoleName,
   toInitials,
@@ -46,6 +45,7 @@ const EMP_POPUP_SIZE = {
 /** KPI card → section scroll + list filter */
 const EMP_KPI_FOCUS = {
   'my-projects': { section: 'projects', projectFilter: 'all', label: 'My projects' },
+  'completed-projects': { section: 'projects', projectFilter: '__closed__', label: 'Completed projects' },
   'my-tasks': { section: 'tasks', taskFilter: 'All', label: 'My tasks' },
   'completion-rate': { section: 'tasks', taskFilter: 'Completed', label: 'Completed tasks' },
   'overdue': { section: 'tasks', taskFilter: 'Overdue', label: 'Overdue tasks' },
@@ -483,6 +483,16 @@ function EmpKPICards({ data, isLoadingTasks = false, isLoadingProjects = false, 
       loading: isLoadingProjects,
     },
     {
+      key: 'completed-projects',
+      title: 'Completed Projects',
+      value: <AnimatedValue value={data.completedProjects} />,
+      subtitle: `${data.completedProjects} closed`,
+      icon: 'ri-checkbox-circle-line',
+      theme: EMP_KPI_THEME.completed,
+      trend: { value: `${data.completedProjects} done`, positive: true },
+      loading: isLoadingProjects,
+    },
+    {
       key: 'my-tasks',
       title: 'My Tasks',
       value: <AnimatedValue value={data.totalSubtasks} />,
@@ -521,7 +531,7 @@ function EmpKPICards({ data, isLoadingTasks = false, isLoadingProjects = false, 
   ];
 
   return (
-    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-4 md:gap-5 xl:grid-cols-4">
+    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-4 md:gap-5 xl:grid-cols-5">
       {cards.map((card, index) => (
         <EmpPremiumKPICard
           key={card.key}
@@ -725,6 +735,8 @@ const ragConfig = {
 
 const statusBadge = {
   Active: 'bg-blue-50 text-[#1E88E5]',
+  Closed: 'bg-green-50 text-[#43A047]',
+  closed: 'bg-green-50 text-[#43A047]',
   Completed: 'bg-green-50 text-[#43A047]',
   'On Hold': 'bg-orange-50 text-[#FB8C00]',
   Planning: 'bg-purple-50 text-purple-600',
@@ -795,8 +807,11 @@ function EmpProjectsTable({ projects, isLoading = false, onOpenProjectPopup, foc
     () => [
       { value: 'all', label: 'All Status' },
       { value: '__active__', label: 'Active (not completed)' },
+      { value: '__closed__', label: 'Closed' },
       { value: 'delayed', label: 'Delayed' },
-      ...distinctFilterOptions(list, (p) => p.status, { allLabel: 'All Status' }).slice(1),
+      ...distinctFilterOptions(list, (p) => p.status, { allLabel: 'All Status' })
+        .slice(1)
+        .filter((o) => o.value !== '__active__' && o.value !== '__closed__'),
     ],
     [list],
   );
@@ -807,7 +822,9 @@ function EmpProjectsTable({ projects, isLoading = false, onOpenProjectPopup, foc
       if (ownerFilter !== 'all' && p.owner !== ownerFilter) return false;
       if (ragFilter !== 'all' && p.rag !== ragFilter) return false;
       if (statusFilter === '__active__') {
-        if (String(p.status || '').toLowerCase() === 'completed') return false;
+        if (isProjectClosed(p.status)) return false;
+      } else if (statusFilter === '__closed__' || statusFilter === 'Completed') {
+        if (!isProjectClosed(p.status)) return false;
       } else if (statusFilter === 'delayed' || statusFilter === 'Red') {
         if (!(p.rag === 'Red' || Number(p.delayDays) > 0)) return false;
       } else if (statusFilter !== 'all' && String(p.status || '').trim() !== statusFilter) {
@@ -1167,7 +1184,9 @@ function EmpSubtasksTable({ tasks, isLoading = false, onOpenTaskPopup, focusFilt
               ? t.status === 'Not Started' || t.status === 'Pending'
               : filter === 'Overdue'
                 ? t.status === 'Overdue' || t.isOverdue
-                : t.status === filter;
+                : filter === 'Completed'
+                  ? isTaskCompleted(t.status)
+                  : t.status === filter;
         const matchSearch =
           String(t.taskName).toLowerCase().includes(search.toLowerCase()) ||
           String(t.projectName).toLowerCase().includes(search.toLowerCase());
@@ -1540,23 +1559,6 @@ function applyTaskProgressToProject(row, allTasks) {
   };
 }
 
-function getRelevantProjectIds(rows, tasks, kfUser) {
-  const assigned = tasks.filter((t) =>
-    personMatches(kfUser, { id: t.assignedToId, email: t.assignedToEmail, name: t.assignedTo }),
-  );
-  const projectIdsFromTasks = new Set(assigned.map((t) => t.projectId).filter(Boolean));
-  const projectRefsFromTasks = new Set(assigned.map((t) => String(t.projectRef || '').trim()).filter(Boolean));
-
-  return rows
-    .filter(
-      (r) =>
-        personMatches(kfUser, { id: r.ownerId, email: r.ownerEmail, name: r.owner }) ||
-        projectIdsFromTasks.has(r.id) ||
-        projectRefsFromTasks.has(String(r.displayId || '').trim()),
-    )
-    .map((r) => r.id);
-}
-
 function mapActivityLogs(activityHistory) {
   return (activityHistory || []).map((h) => ({
     id: h.key,
@@ -1706,24 +1708,8 @@ function EmployeeDashboardPage({ useLayout: useLayoutProp = true }) {
             throw err;
           });
 
-        const [tasks, summary] = await Promise.all([tasksPromise, listPromise]);
+        await Promise.all([tasksPromise, listPromise]);
         if (cancelled) return;
-
-        const kfUser = kfInstance?.user || {};
-        const relevantIds = getRelevantProjectIds(summary.rows, tasks, kfUser);
-        if (relevantIds.length === 0) return;
-
-        const enriched = await enrichProjectRows(kfInstance, {
-          listItems: summary.listItems,
-          itemIds: relevantIds,
-          fieldIds: summary.fieldIds,
-          accountId: summary.accountId,
-          concurrency: 4,
-        });
-        if (cancelled || enriched.length === 0) return;
-
-        const byId = Object.fromEntries(enriched.map((row) => [row.id, row]));
-        setApiRows((prev) => prev.map((row) => byId[row.id] || row));
       } catch (e) {
         if (!cancelled) {
           console.warn('Employee dashboard fetch failed:', e?.message || e);
@@ -1859,6 +1845,7 @@ function EmployeeDashboardPage({ useLayout: useLayoutProp = true }) {
 
   const kpiData = {
     totalProjects: filteredProjects.length,
+    completedProjects: filteredProjects.filter((p) => isProjectClosed(p.status)).length,
     totalSubtasks: filteredSubtasks.length,
     completedTasks: completedCount,
     completionRate,

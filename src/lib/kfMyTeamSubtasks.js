@@ -116,6 +116,7 @@ function resolveParentTask(read) {
   const taskRef = read('Task_ID') || read('Parent_Task') || read('Parent_Task_ID');
   let parentTaskName = '';
   let parentTaskId = '';
+  let projectName = '';
   if (taskRef && typeof taskRef === 'object' && !Array.isArray(taskRef)) {
     // Parent task display = Task_ID.Sub_Task_Name (e.g. "alpha"), then Name.
     parentTaskName = String(
@@ -124,6 +125,7 @@ function resolveParentTask(read) {
     parentTaskId = String(
       taskRef.Subtaxk_id || taskRef.Task_ID_Formulated || taskRef._id || taskRef.Id || '',
     ).trim();
+    projectName = String(taskRef.Project || taskRef.Project_Name || '').trim();
   }
   if (!parentTaskName) {
     parentTaskName =
@@ -142,6 +144,7 @@ function resolveParentTask(read) {
   return {
     parentTaskName: parentTaskName || '—',
     parentTaskId: parentTaskId || '—',
+    projectName,
   };
 }
 
@@ -224,10 +227,11 @@ export function mapMyTeamSubtaskRow(row, columns) {
     projectId: projectId || '—',
     projectIds,
     projectName:
+      parent.projectName ||
       toText(read('Project_Name')) ||
       toText(read('Application_Name')) ||
       (projectRef && typeof projectRef === 'object'
-        ? String(projectRef.Project_Name || projectRef.Name || '').trim()
+        ? String(projectRef.Project_Name || projectRef.Project || projectRef.Name || '').trim()
         : '') ||
       '—',
     projectTaskId: toText(read('Project_Task_ID')) || '—',

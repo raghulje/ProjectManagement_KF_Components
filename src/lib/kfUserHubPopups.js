@@ -11,6 +11,11 @@
 
 import { createPmProcessDraft } from './kfPmMyItemsCreate.js';
 import { SUBTASKS_ENTITY } from './pmMyItemsEntities.js';
+import {
+  fetchSubtaskAdminDetailById,
+  itemHasLiveQueueContext,
+  resolveCurrentActivityInstanceId,
+} from './kfSubtaskTracker.js';
 
 const USER_HUB_POPUP_IDS = {
   project: 'Popup_Xrl9X_fXTJ',
@@ -30,6 +35,57 @@ const POPUP_SIZE = {
 
 function resolveKfSdk(kfInstance) {
   return kfInstance ?? (typeof window !== 'undefined' ? window.kf : null);
+}
+
+function unwrapInstancePayload(response) {
+  if (!response || typeof response !== 'object') return null;
+  if (response.Data && typeof response.Data === 'object' && !Array.isArray(response.Data)) {
+    return response.Data;
+  }
+  if (response.data && typeof response.data === 'object' && !Array.isArray(response.data)) {
+    return response.data;
+  }
+  return response;
+}
+
+/** mis-table-kf: instance_id always; activity_instance_id only when still in a live queue. */
+function buildHubProcessPopupParams(instanceId, activityId) {
+  const id = String(instanceId || '').trim();
+  const aid = String(activityId || '').trim();
+  const params = {
+    InstanceID: id,
+    instance_id: id,
+    ...POPUP_SIZE,
+  };
+  if (aid) {
+    params.ActivityID = aid;
+    params.ActivityInstanceID = aid;
+    params.activity_instance_id = aid;
+  }
+  return params;
+}
+
+async function resolveLiveSubtaskOpenIds(kfInstance, row) {
+  const raw = row?.raw ?? row ?? {};
+  const instanceId = String(
+    raw?._id ?? row?.InstanceID ?? row?.InstanceId ?? row?.instanceId ?? row?.id ?? '',
+  ).trim();
+  let activityId = resolveCurrentActivityInstanceId(row);
+  let inQueue = itemHasLiveQueueContext(row);
+
+  if (instanceId && kfInstance) {
+    try {
+      const detail = unwrapInstancePayload(await fetchSubtaskAdminDetailById(kfInstance, instanceId));
+      if (detail) {
+        inQueue = itemHasLiveQueueContext(detail);
+        activityId = inQueue ? resolveCurrentActivityInstanceId(detail) : '';
+      }
+    } catch (err) {
+      console.warn('UserHub subtask: live activity refresh failed', err?.message || err);
+    }
+  }
+
+  return { instanceId, activityId: inQueue ? activityId : '', inQueue };
 }
 
 function attachPopupClose(promise, onClosed) {
@@ -180,23 +236,22 @@ export function resolveUserHubSubtaskPopupIds(row) {
  * UserHubTasksProject only — open/create subtask form via Popup_WbcLURdUXx.
  * Pass a row or `{ InstanceID, ActivityID }` (e.g. after createSubtaskInstance).
  */
-export function openUserHubSubtaskPopup(kfInstance, row, options = {}) {
+export async function openUserHubSubtaskPopup(kfInstance, row, options = {}) {
   const sdk = resolveKfSdk(kfInstance);
-  const { instanceId, activityId } = resolveUserHubSubtaskPopupIds(row);
   if (typeof sdk?.app?.page?.openPopup !== 'function') {
     console.warn('UserHub subtask popup: openPopup not available');
     return false;
   }
-  if (!instanceId || !activityId) {
-    sdk?.client?.showInfo?.('Missing InstanceID or ActivityID for this subtask.');
+  const { instanceId, activityId } = await resolveLiveSubtaskOpenIds(sdk, row);
+  if (!instanceId) {
+    sdk?.client?.showInfo?.('Missing InstanceID for this subtask.');
     return false;
   }
   try {
-    const p = sdk.app.page.openPopup(USER_HUB_POPUP_IDS.subtask, {
-      InstanceID: instanceId,
-      ActivityID: activityId,
-      ...POPUP_SIZE,
-    });
+    const p = sdk.app.page.openPopup(
+      USER_HUB_POPUP_IDS.subtask,
+      buildHubProcessPopupParams(instanceId, activityId),
+    );
     attachPopupClose(p, options.onClosed);
     if (p && typeof p.catch === 'function') {
       p.catch((err) => console.warn('UserHub subtask popup failed:', err));
@@ -232,24 +287,20 @@ export function resolveUserHubSubtaskProcessPopupIds(row) {
  * Params: ActivityID, InstanceID.
  * Optional `options.popupId` overrides the default popup (e.g. UserSpecificPT My Work).
  */
-export function openUserHubSubtaskProcessPopup(kfInstance, row, options = {}) {
+export async function openUserHubSubtaskProcessPopup(kfInstance, row, options = {}) {
   const sdk = resolveKfSdk(kfInstance);
-  const { instanceId, activityId } = resolveUserHubSubtaskProcessPopupIds(row);
   const popupId = String(options.popupId || USER_HUB_POPUP_IDS.subtaskProcess).trim();
   if (typeof sdk?.app?.page?.openPopup !== 'function') {
     console.warn('UserHub subtask process popup: openPopup not available');
     return false;
   }
-  if (!instanceId || !activityId) {
-    sdk?.client?.showInfo?.('Missing InstanceID or ActivityID for this subtask.');
+  const { instanceId, activityId } = await resolveLiveSubtaskOpenIds(sdk, row);
+  if (!instanceId) {
+    sdk?.client?.showInfo?.('Missing InstanceID for this subtask.');
     return false;
   }
   try {
-    const p = sdk.app.page.openPopup(popupId, {
-      InstanceID: instanceId,
-      ActivityID: activityId,
-      ...POPUP_SIZE,
-    });
+    const p = sdk.app.page.openPopup(popupId, buildHubProcessPopupParams(instanceId, activityId));
     attachPopupClose(p, options.onClosed);
     if (p && typeof p.catch === 'function') {
       p.catch((err) => console.warn('UserHub subtask process popup failed:', err));

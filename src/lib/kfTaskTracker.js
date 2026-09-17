@@ -468,7 +468,7 @@ export function mapProcessSubtaskItem(item) {
     agingDays: 0,
     delayDays: 0,
     _id: item.id,
-    _activity_instance_id: item.activityInstanceId,
+    _activity_instance_id: item.activityInstanceId ?? raw?._activity_instance_id,
     InstanceID: item.id,
     ActivityID: item.activityInstanceId,
     raw: raw || item,
@@ -1032,6 +1032,15 @@ export async function fetchTaskTrackerData(kfInstance, options = {}) {
   });
 
   return dedupeTaskRows(mapped);
+}
+
+/** Enrich already-mapped task rows (Revised / history) without re-paging the list. */
+export async function enrichTaskTrackerRows(kfInstance, mappedRows, options = {}) {
+  const list = Array.isArray(mappedRows) ? mappedRows : [];
+  if (!list.length || !kfInstance) return list;
+  const raws = list.map((row) => (row?.raw && typeof row.raw === 'object' ? row.raw : row));
+  const enriched = await enrichRawTaskRowsWithInstanceDetail(kfInstance, raws, options);
+  return dedupeTaskRows(enriched.map((r, idx) => mapAdminTaskRow(r, idx)));
 }
 
 /**
