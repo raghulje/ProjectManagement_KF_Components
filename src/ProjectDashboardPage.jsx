@@ -857,6 +857,7 @@ function getPeriodCategoryScopeLabel(filters) {
   const parts = (Array.isArray(filters?.periodParts) ? filters.periodParts : []).filter(
     (p) => p && p !== 'FULL',
   );
+  if (mode === 'daily') return 'this day';
   if (mode === 'weekly') return 'this week';
   if (mode === 'monthly') return 'this month';
   if (mode === 'fy') {
@@ -2516,7 +2517,7 @@ function formatProjectRef(displayId, rowId) {
   return raw;
 }
 
-function ProjectHealthTable({ data, allTasks, allProcessSubtasks, onOpenTaskPopup, onOpenSubtaskPopup, onOpenProjectPopup, onCreateTaskPopup, onCreateSubtask, onRefreshTasks, refreshingTasks, insightFilter = null, headerActions = null }) {
+function ProjectHealthTable({ data, allTasks, allProcessSubtasks, onOpenTaskPopup, onOpenSubtaskPopup, onOpenProjectPopup, onCreateTaskPopup, onCreateSubtask, onRefreshTasks, refreshingTasks, insightFilter = null, headerActions = null, onEnsureWorkItems = null }) {
   const [ragFilter, setRagFilter] = useState('all');
   const [statusFilter, setStatusFilter] = useState('all');
   const [ownerFilter, setOwnerFilter] = useState('all');
@@ -2665,7 +2666,13 @@ function ProjectHealthTable({ data, allTasks, allProcessSubtasks, onOpenTaskPopu
   }, [search, ragFilter, statusFilter, ownerFilter, nameFilter, page, sortKey, sortDir]);
 
   const toggleExpand = (row) => {
-    setExpandedId((id) => (id === row.id ? null : row.id));
+    setExpandedId((id) => {
+      const next = id === row.id ? null : row.id;
+      if (next && typeof onEnsureWorkItems === 'function') {
+        void onEnsureWorkItems();
+      }
+      return next;
+    });
   };
 
   const handleSort = (key) => {
@@ -5683,6 +5690,11 @@ function DashboardPagePremium({
   /** User Hub tasks: table rows come from myitems/pending/participated — skip heavy report portfolio. */
   const lightHubTasksMode =
     Boolean(embeddedInHub) && contentView === 'tasks' && overrideTasks != null;
+  /** User Hub projects: list cases only on mount — defer tasks/subtasks until an accordion expands. */
+  const lightHubProjectsMode =
+    Boolean(embeddedInHub) && contentView === 'projects';
+
+  const hubWorkItemsLoadedRef = useRef(false);
 
   const reloadDashboardData = useCallback(async () => {
     if (!kfInstance?.api) return;
@@ -5697,6 +5709,21 @@ function DashboardPagePremium({
       } catch (error) {
         console.warn('Hub process subtasks fetch failed:', error?.message || error);
         setApiProcessSubtaskData([]);
+      }
+      return;
+    }
+
+    // Projects hub: one case-list fetch. Avoid tenant-wide task/subtask + ≤80 detail N+1 (rate limits).
+    if (lightHubProjectsMode) {
+      hubWorkItemsLoadedRef.current = false;
+      setApiSubtaskData([]);
+      setApiProcessSubtaskData([]);
+      try {
+        const projectsRes = await fetchProjectDashboardData(kfInstance);
+        setApiProjectData(projectsRes?.rows ?? []);
+      } catch (error) {
+        console.warn('Hub projects fetch failed:', error?.message || error);
+        setApiProjectData([]);
       }
       return;
     }
@@ -5722,6 +5749,7 @@ function DashboardPagePremium({
     setApiProcessSubtaskData(processSubtasks);
 
     // Revised badges need per-task history; fill in after the portfolio is on screen.
+    // Skip on projects hub (handled above) — detail enrich floods the ~400/min Kissflow limit.
     if (subtasks.length > 0) {
       void enrichTaskTrackerRows(kfInstance, subtasks)
         .then((enriched) => {
@@ -5731,7 +5759,34 @@ function DashboardPagePremium({
           console.warn('Task revision enrich failed:', error?.message || error);
         });
     }
-  }, [kfInstance, lightHubTasksMode]);
+  }, [kfInstance, lightHubTasksMode, lightHubProjectsMode]);
+
+  /** Lazy-load tasks + process subtasks once when a projects-hub accordion opens. */
+  const ensureHubProjectWorkItems = useCallback(async () => {
+    if (!lightHubProjectsMode || !kfInstance?.api) return;
+    if (hubWorkItemsLoadedRef.current) return;
+    hubWorkItemsLoadedRef.current = true;
+    try {
+      const [tasksRes, processSubtasksRes] = await Promise.allSettled([
+        fetchSubtaskTrackerData(kfInstance),
+        fetchAllSubtasks(kfInstance, { enrichDetails: false }),
+      ]);
+      if (tasksRes.status === 'fulfilled') {
+        setApiSubtaskData(tasksRes.value ?? []);
+      } else {
+        console.warn('Hub projects lazy tasks failed:', tasksRes.reason?.message || tasksRes.reason);
+        hubWorkItemsLoadedRef.current = false;
+      }
+      if (processSubtasksRes.status === 'fulfilled') {
+        setApiProcessSubtaskData(
+          (processSubtasksRes.value?.items ?? []).map(mapProcessSubtaskItem),
+        );
+      }
+    } catch (error) {
+      hubWorkItemsLoadedRef.current = false;
+      console.warn('Hub projects lazy work items failed:', error?.message || error);
+    }
+  }, [kfInstance, lightHubProjectsMode]);
 
   const handleOpenTaskDetail = useCallback((row) => {
     if (!row) return false;
@@ -5775,6 +5830,10 @@ function DashboardPagePremium({
     setRefreshingTasks(true);
     try {
       await reloadDashboardData();
+      if (lightHubProjectsMode) {
+        hubWorkItemsLoadedRef.current = false;
+        await ensureHubProjectWorkItems();
+      }
       return true;
     } catch (error) {
       console.warn('Refresh tasks failed:', error);
@@ -5782,7 +5841,7 @@ function DashboardPagePremium({
     } finally {
       setRefreshingTasks(false);
     }
-  }, [reloadDashboardData]);
+  }, [reloadDashboardData, lightHubProjectsMode, ensureHubProjectWorkItems]);
 
   const handleCreateTaskForProject = useCallback(
     async (project) => {
@@ -5945,6 +6004,11 @@ function DashboardPagePremium({
     async function run() {
       try {
         await reloadDashboardData();
+        // Projects hub: after case list paints, load tasks/subtasks in background (no detail enrich).
+        // Keeps progress % / task counts accurate without the ≤80 N+1 surge.
+        if (!cancelled && lightHubProjectsMode) {
+          void ensureHubProjectWorkItems();
+        }
       } catch (error) {
         if (!cancelled) {
           console.warn('Project items fetch failed:', error?.message || error);
@@ -5956,7 +6020,7 @@ function DashboardPagePremium({
     }
     run();
     return () => { cancelled = true; };
-  }, [reloadDashboardData]);
+  }, [reloadDashboardData, lightHubProjectsMode, ensureHubProjectWorkItems]);
 
   // User dashboard → My Team projects (same report as UserSpecificPT).
   useEffect(() => {
@@ -6783,6 +6847,7 @@ function DashboardPagePremium({
               onCreateSubtask={handleCreateSubtaskForTask}
               onRefreshTasks={handleRefreshTasks}
               refreshingTasks={refreshingTasks}
+              onEnsureWorkItems={lightHubProjectsMode ? ensureHubProjectWorkItems : null}
               insightFilter={
                 insightFocus?.section === 'health'
                   ? {

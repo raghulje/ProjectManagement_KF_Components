@@ -17,11 +17,14 @@ import TasksMyItemsPro from './TasksMyItemsPro.jsx'
 import SubtasksMyItemsPro from './SubtasksMyItemsPro.jsx'
 import CRMyItemsPro from './CRMyItemsPro.jsx'
 import AdminTasks from './AdminTasks.jsx'
+import UserHubGanttProject from './UserHubGanttProject.jsx'
 
 function App() {
   return (
     <div className="rootDiv">
-      <ProjectDashboardPage />
+      {/* <UserHubGanttProject /> */}
+      {/* <GanttChart /> */}
+      {/* <ProjectDashboardPage /> */}
       {/* <UserDashboardProject /> */}
       {/* <UserSpecificPT /> */}
       {/* <AdminTasks /> */}
@@ -31,7 +34,7 @@ function App() {
       {/* <TasksDashboardProject /> */}
       {/* <SubTasksDashboardProject /> */}
       {/* <CRDashboardProject /> */}
-      {/* <UserHubProjectsProject /> */}
+      <UserHubProjectsProject />
       {/* <UserHubTasksProject /> */}
       {/* <UserHubSubTasksProject /> */}
       {/* <ProjectsMyItemsPro /> */}

@@ -73,11 +73,93 @@ export function resolveKissflowAccountId(kfInstance, fallbackAccountId = '') {
 }
 
 export async function kfGetJson(kfInstance, path, _legacyAbsoluteUrl) {
-  if (!kfInstance?.api) {
-    throw new Error('Kissflow SDK not ready — open this page inside Kissflow.');
+  if (kfInstance?.api) {
+    const resp = await kfInstance.api(path, { method: 'GET', headers: { Accept: 'application/json' } });
+    return resp?.data ?? resp ?? null;
   }
-  const resp = await kfInstance.api(path, { method: 'GET', headers: { Accept: 'application/json' } });
-  return resp?.data ?? resp ?? null;
+  return kfGetJsonWithAccessKeys(kfInstance, path);
+}
+
+/** GET via tenant access keys (same credentials as ProjectDashboard / kfAccessKeys). */
+export async function kfGetJsonWithAccessKeys(kfInstance, path) {
+  const tenantKeys = getTenantAccessKeys(kfInstance);
+  const keyId = String(tenantKeys.accessKeyId || '').trim();
+  const keySecret = String(tenantKeys.accessKeySecret || '').trim();
+  if (!keyId || !keySecret) {
+    throw new Error(
+      `Missing Kissflow access keys for ${tenantKeys.tenant} tenant. Set VITE_KF${tenantKeys.tenant === 'live' ? '_LIVE' : ''}_ACCESS_KEY_ID and VITE_KF${tenantKeys.tenant === 'live' ? '_LIVE' : ''}_ACCESS_KEY_SECRET, then rebuild.`,
+    );
+  }
+
+  const origin = resolveKissflowApiOrigin(kfInstance);
+  const headers = buildKissflowAccessKeyHeaders(keyId, keySecret, kfInstance);
+  const res = await fetch(`${origin}${path}`, {
+    method: 'GET',
+    credentials: 'omit',
+    headers,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = parseKfApiError(data, res.status);
+    throw new Error(err || `HTTP ${res.status}`);
+  }
+  const err = parseKfApiError(data, res.status);
+  if (err) throw new Error(err);
+  return data;
+}
+
+/**
+ * Lightweight KF client for local `npm run dev` / preview when the Lowcode SDK
+ * is not embedded. Uses the same access keys + account as ProjectDashboardPage.
+ *
+ * In Vite DEV on localhost, requests are same-origin (`/case/...`) so the
+ * vite.config proxy can forward them to development-refexgroup (avoids CORS).
+ */
+export function createAccessKeyKfClient(kfInstance = null) {
+  const tenantKeys = getTenantAccessKeys(kfInstance);
+  const accountId = resolveKissflowAccountId(kfInstance, tenantKeys.defaultAccountId);
+  const isLocalDev =
+    typeof window !== 'undefined' &&
+    /^(localhost|127\.0\.0\.1)$/i.test(window.location.hostname) &&
+    Boolean(import.meta?.env?.DEV);
+  const origin = isLocalDev ? '' : resolveKissflowApiOrigin(kfInstance);
+  const headers = buildKissflowAccessKeyHeaders(
+    tenantKeys.accessKeyId,
+    tenantKeys.accessKeySecret,
+    kfInstance,
+  );
+
+  return {
+    account: { _id: accountId },
+    user: kfInstance?.user || { Name: 'Access Key', Email: '' },
+    client: kfInstance?.client || null,
+    app: kfInstance?.app || null,
+    /** Same shape as Kissflow Lowcode `kf.api` — used by dashboard fetch helpers. */
+    api: async (path, options = {}) => {
+      const method = String(options.method || 'GET').toUpperCase();
+      const res = await fetch(`${origin}${path}`, {
+        method,
+        credentials: 'omit',
+        headers: { ...headers, ...(options.headers || {}) },
+        ...(options.body != null ? { body: options.body } : {}),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const err = parseKfApiError(data, res.status);
+        throw new Error(err || `HTTP ${res.status}`);
+      }
+      const err = parseKfApiError(data, res.status);
+      if (err) throw new Error(err);
+      return data;
+    },
+  };
+}
+
+export function hasKissflowAccessKeys(kfInstance = null) {
+  const tenantKeys = getTenantAccessKeys(kfInstance);
+  return Boolean(
+    String(tenantKeys.accessKeyId || '').trim() && String(tenantKeys.accessKeySecret || '').trim(),
+  );
 }
 
 /** Run async work over items with a concurrency cap (avoids flooding Kissflow with N parallel calls). */

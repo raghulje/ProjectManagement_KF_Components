@@ -97,5 +97,28 @@ export default defineConfig({
   server: {
     port: 3000,
     host: "0.0.0.0",
+    proxy: {
+      // Local npm run dev — same Kissflow APIs ProjectDashboard uses (via access keys).
+      "/case": {
+        target: "https://development-refexgroup.kissflow.com",
+        changeOrigin: true,
+        secure: true,
+      },
+      "/process": {
+        target: "https://development-refexgroup.kissflow.com",
+        changeOrigin: true,
+        secure: true,
+      },
+      "/process-report": {
+        target: "https://development-refexgroup.kissflow.com",
+        changeOrigin: true,
+        secure: true,
+      },
+      "/user": {
+        target: "https://development-refexgroup.kissflow.com",
+        changeOrigin: true,
+        secure: true,
+      },
+    },
   },
 });

@@ -5,6 +5,7 @@
  * UserHubTasksProject:     Popup_WbcLURdUXx (ActivityID, InstanceID) — nested subtasks (tasks page only)
  * UserHubSubTasksProject:  Popup_djVrj_A4yG (ActivityID, InstanceID) — Sub_Task_Process_A00
  *
+ * Optional `options.popupId` overrides the default ID (used by GanttChart via kfGanttPopups.js).
  * Optional `options.onClosed` runs when openPopup's promise settles (if Kissflow resolves it).
  * Prefer page-level `context.watchParams` for reliable post-action refresh — openPopup often never resolves.
  */
@@ -135,6 +136,7 @@ export function resolveUserHubTaskPopupIds(row) {
 export function openUserHubProjectPopup(kfInstance, row, options = {}) {
   const sdk = resolveKfSdk(kfInstance);
   const caseId = resolveUserHubProjectCaseId(row);
+  const popupId = String(options.popupId || USER_HUB_POPUP_IDS.project).trim();
   if (typeof sdk?.app?.page?.openPopup !== 'function') {
     console.warn('UserHub project popup: openPopup not available');
     return false;
@@ -144,7 +146,7 @@ export function openUserHubProjectPopup(kfInstance, row, options = {}) {
     return false;
   }
   try {
-    const p = sdk.app.page.openPopup(USER_HUB_POPUP_IDS.project, {
+    const p = sdk.app.page.openPopup(popupId, {
       CaseID: caseId,
       ...POPUP_SIZE,
     });
@@ -202,6 +204,7 @@ export function openUserHubTaskCreatePopup(kfInstance, options = {}) {
 export function openUserHubTaskPopup(kfInstance, row, options = {}) {
   const sdk = resolveKfSdk(kfInstance);
   const { instanceId, activityId } = resolveUserHubTaskPopupIds(row);
+  const popupId = String(options.popupId || USER_HUB_POPUP_IDS.task).trim();
   if (typeof sdk?.app?.page?.openPopup !== 'function') {
     console.warn('UserHub task popup: openPopup not available');
     return false;
@@ -211,7 +214,7 @@ export function openUserHubTaskPopup(kfInstance, row, options = {}) {
     return false;
   }
   try {
-    const p = sdk.app.page.openPopup(USER_HUB_POPUP_IDS.task, {
+    const p = sdk.app.page.openPopup(popupId, {
       InstanceID: instanceId,
       ActivityID: activityId,
       ...POPUP_SIZE,
@@ -238,6 +241,7 @@ export function resolveUserHubSubtaskPopupIds(row) {
  */
 export async function openUserHubSubtaskPopup(kfInstance, row, options = {}) {
   const sdk = resolveKfSdk(kfInstance);
+  const popupId = String(options.popupId || USER_HUB_POPUP_IDS.subtask).trim();
   if (typeof sdk?.app?.page?.openPopup !== 'function') {
     console.warn('UserHub subtask popup: openPopup not available');
     return false;
@@ -249,7 +253,7 @@ export async function openUserHubSubtaskPopup(kfInstance, row, options = {}) {
   }
   try {
     const p = sdk.app.page.openPopup(
-      USER_HUB_POPUP_IDS.subtask,
+      popupId,
       buildHubProcessPopupParams(instanceId, activityId),
     );
     attachPopupClose(p, options.onClosed);

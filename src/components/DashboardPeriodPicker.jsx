@@ -54,24 +54,43 @@ export function getFinancialYearRange(fyStartYear, { capToToday = true } = {}) {
   return { from: padDateInput(from), to: padDateInput(to), fyStartYear };
 }
 
-export function getWeekRange(mondayDate, { capToToday = true } = {}) {
+export function getWeekRange(mondayDate, { capToToday = true, throughDate = null } = {}) {
   const from = startOfDay(mondayDate);
   let to = new Date(from);
   to.setDate(to.getDate() + 6);
-  if (capToToday) {
-    const today = startOfDay(new Date());
-    if (to > today) to = today;
-  }
+  const cap = throughDate
+    ? startOfDay(throughDate instanceof Date ? throughDate : new Date(throughDate))
+    : capToToday
+      ? startOfDay(new Date())
+      : null;
+  if (cap && to > cap) to = cap;
+  if (to < from) to = new Date(from);
   return { from: padDateInput(from), to: padDateInput(to), monday: from };
 }
 
-export function getMonthRange(year, monthIndex, { capToToday = true } = {}) {
+/** Single calendar day (from/to same date). */
+export function getDayRange(date, { capToToday = true, throughDate = null } = {}) {
+  let day = startOfDay(date instanceof Date ? date : new Date(date));
+  const cap = throughDate
+    ? startOfDay(throughDate instanceof Date ? throughDate : new Date(throughDate))
+    : capToToday
+      ? startOfDay(new Date())
+      : null;
+  if (cap && day > cap) day = cap;
+  const iso = padDateInput(day);
+  return { from: iso, to: iso, date: day };
+}
+
+export function getMonthRange(year, monthIndex, { capToToday = true, throughDate = null } = {}) {
   const from = new Date(year, monthIndex, 1);
   let to = new Date(year, monthIndex + 1, 0);
-  if (capToToday) {
-    const today = startOfDay(new Date());
-    if (to > today) to = today;
-  }
+  const cap = throughDate
+    ? startOfDay(throughDate instanceof Date ? throughDate : new Date(throughDate))
+    : capToToday
+      ? startOfDay(new Date())
+      : null;
+  if (cap && to > cap) to = cap;
+  if (to < from) to = new Date(from);
   return { from: padDateInput(from), to: padDateInput(to), year, monthIndex };
 }
 
@@ -130,9 +149,20 @@ export function formatFyPartsLabel(fyStartYear, parts = []) {
   return `${fyLabel} · ${selected.join(', ')}`;
 }
 
-export function buildMonthWeekOptions(year, monthIndex) {
+function resolveHorizonCap(throughDate) {
+  if (!throughDate) return startOfDay(new Date());
+  const d = throughDate instanceof Date ? throughDate : new Date(throughDate);
+  if (Number.isNaN(d.getTime())) return startOfDay(new Date());
+  const today = startOfDay(new Date());
+  const end = startOfDay(d);
+  // Horizon may be in the past or future — always at least today so current periods stay available.
+  return end > today ? end : today;
+}
+
+export function buildMonthWeekOptions(year, monthIndex, { throughDate = null } = {}) {
   const now = new Date();
   const currentMonday = getMonday(now);
+  const lastMonday = getMonday(resolveHorizonCap(throughDate));
   const monthStart = new Date(year, monthIndex, 1);
   const monthEnd = new Date(year, monthIndex + 1, 0);
   let monday = getMonday(monthStart);
@@ -146,16 +176,19 @@ export function buildMonthWeekOptions(year, monthIndex) {
     if (monday > monthEnd) break;
 
     if (overlapsMonth) {
-      if (monday.getTime() > currentMonday.getTime()) break;
+      if (monday.getTime() > lastMonday.getTime()) break;
       weekNumber += 1;
       const isCurrent = monday.getTime() === currentMonday.getTime();
-      const range = getWeekRange(monday, { capToToday: isCurrent });
+      const range = getWeekRange(monday, {
+        capToToday: !throughDate && isCurrent,
+        throughDate: throughDate || undefined,
+      });
       const weekEndLabel = new Date(monday.getFullYear(), monday.getMonth(), monday.getDate() + 6);
       options.push({
         key: `week:${range.from}`,
         label: isCurrent ? 'Current week' : `Week ${weekNumber}`,
         sub: `Mon ${formatShortDate(monday)} → ${formatShortDate(weekEndLabel)}`,
-        hint: isCurrent ? 'Mon → Today' : undefined,
+        hint: isCurrent && !throughDate ? 'Mon → Today' : undefined,
         range: { from: range.from, to: range.to },
       });
     }
@@ -167,11 +200,41 @@ export function buildMonthWeekOptions(year, monthIndex) {
   return options.reverse();
 }
 
-export function buildWeekNavOptions({ year, monthIndex } = {}) {
+/** Days in a month up to today, or through `throughDate` (e.g. project end on Gantt). */
+export function buildMonthDayOptions(year, monthIndex, { throughDate = null } = {}) {
+  const cap = resolveHorizonCap(throughDate);
+  const today = startOfDay(new Date());
+  const daysInMonth = new Date(year, monthIndex + 1, 0).getDate();
+  const options = [];
+
+  for (let day = 1; day <= daysInMonth; day += 1) {
+    const date = new Date(year, monthIndex, day);
+    if (date.getTime() > cap.getTime()) break;
+    const isToday = date.getTime() === today.getTime();
+    const range = getDayRange(date, { capToToday: false });
+    options.push({
+      key: `day:${range.from}`,
+      label: isToday ? 'Today' : String(day),
+      sub: date.toLocaleDateString(undefined, {
+        weekday: 'short',
+        day: 'numeric',
+        month: 'short',
+      }),
+      hint: isToday ? 'Selected day' : undefined,
+      range: { from: range.from, to: range.to },
+      dayNumber: day,
+      isToday,
+    });
+  }
+
+  return options.reverse();
+}
+
+export function buildWeekNavOptions({ year, monthIndex, throughDate = null } = {}) {
   const now = new Date();
   const y = Number.isFinite(year) ? year : now.getFullYear();
   const m = Number.isFinite(monthIndex) ? monthIndex : now.getMonth();
-  return buildMonthWeekOptions(y, m);
+  return buildMonthWeekOptions(y, m, { throughDate });
 }
 
 export function getCurrentWeekPeriodState() {
@@ -203,18 +266,24 @@ export function getCurrentWeekPeriodState() {
   };
 }
 
-export function buildMonthOptions(year) {
+export function buildMonthOptions(year, { throughDate = null } = {}) {
   const now = new Date();
+  const cap = resolveHorizonCap(throughDate);
+  const maxYear = cap.getFullYear();
+  const maxMonth = cap.getMonth();
   const options = [];
   for (let monthIndex = 0; monthIndex < 12; monthIndex += 1) {
-    if (year > now.getFullYear()) continue;
-    if (year === now.getFullYear() && monthIndex > now.getMonth()) continue;
-    const range = getMonthRange(year, monthIndex);
+    if (year > maxYear) continue;
+    if (year === maxYear && monthIndex > maxMonth) continue;
     const isCurrent = year === now.getFullYear() && monthIndex === now.getMonth();
+    const range = getMonthRange(year, monthIndex, {
+      capToToday: !throughDate && isCurrent,
+      throughDate: throughDate || undefined,
+    });
     options.push({
       key: `month:${year}-${monthIndex}`,
       label: formatMonthLabel(year, monthIndex),
-      sub: isCurrent
+      sub: isCurrent && !throughDate
         ? `1 ${new Date(year, monthIndex, 1).toLocaleDateString(undefined, { month: 'short' })} → Today`
         : 'Full month',
       range: { from: range.from, to: range.to },
@@ -223,19 +292,31 @@ export function buildMonthOptions(year) {
   return options;
 }
 
-export function buildFinancialYearOptions(count = 4) {
+export function buildFinancialYearOptions(count = 4, { throughDate = null } = {}) {
   const currentFy = getFyStartYear();
+  const horizonFy = throughDate ? getFyStartYear(resolveHorizonCap(throughDate)) : currentFy;
+  const latestFy = Math.max(currentFy, horizonFy);
   const options = [];
   for (let i = 0; i < count; i += 1) {
-    const fyStartYear = currentFy - i;
-    const range = getFinancialYearRange(fyStartYear);
+    const fyStartYear = latestFy - i;
+    const range = getFinancialYearRange(fyStartYear, {
+      capToToday: !throughDate && fyStartYear === currentFy,
+    });
+    // When Gantt horizon extends past today, keep full FY end (don't clip to today).
+    const fyRange = throughDate
+      ? (() => {
+          const from = new Date(fyStartYear, 3, 1);
+          const to = new Date(fyStartYear + 1, 2, 31);
+          return { from: padDateInput(from), to: padDateInput(to), fyStartYear };
+        })()
+      : range;
     options.push({
       key: `fy:${fyStartYear}`,
       label: `FY ${fyStartYear}–${String(fyStartYear + 1).slice(-2)}`,
       sub: `1 Apr ${fyStartYear} → 31 Mar ${fyStartYear + 1}`,
-      hint: i === 0 ? 'Current financial year' : undefined,
+      hint: fyStartYear === currentFy ? 'Current financial year' : undefined,
       fyStartYear,
-      range: { from: range.from, to: range.to },
+      range: { from: fyRange.from, to: fyRange.to },
     });
   }
   return options;
@@ -257,9 +338,10 @@ export function getDefaultPeriodState() {
 }
 
 const MODE_OPTIONS = [
+  { key: 'daily', label: 'Daily' },
   { key: 'weekly', label: 'Weekly' },
   { key: 'monthly', label: 'Monthly' },
-  { key: 'fy', label: 'Financial Year' },
+  { key: 'fy', label: 'FY' },
 ];
 
 const FY_HALF_CHIPS = [
@@ -275,7 +357,7 @@ const FY_QUARTER_CHIPS = [
 ];
 
 function segmentShell() {
-  return 'grid grid-cols-3 gap-1 rounded-xl border border-slate-200 bg-slate-50 p-1';
+  return 'grid grid-cols-2 gap-1 rounded-xl border border-slate-200 bg-slate-50 p-1 sm:grid-cols-4';
 }
 
 function segmentBtn(active) {
@@ -292,7 +374,7 @@ const TRIGGER_CLASS =
   'relative inline-flex h-auto min-h-[2.5rem] w-full min-w-[9.5rem] items-center rounded-lg border border-slate-200/90 bg-slate-50/90 py-1.5 pl-8 pr-7 text-left text-xs font-medium text-slate-700 shadow-none outline-none transition hover:border-slate-300 hover:bg-white focus:border-[#1E88E5] focus:ring-2 focus:ring-[#1E88E5]/20 sm:min-h-[2rem]';
 
 /**
- * Adaptive period control — Weekly / Monthly / FY (Apr–Mar).
+ * Adaptive period control — Daily / Weekly / Monthly / FY (Apr–Mar).
  * Same visual language as ProjectDashboard filters; FY supports H1·H2·Q1–Q4 multi-select.
  */
 export default function DashboardPeriodPicker({
@@ -306,7 +388,15 @@ export default function DashboardPeriodPicker({
   className = '',
   allowAllTime = true,
   triggerClassName = '',
+  /** When set (e.g. Gantt latest project end), Daily/Weekly/Monthly options extend through this date instead of stopping at today. */
+  horizonEnd = null,
 }) {
+  const horizonCap = useMemo(() => {
+    if (!horizonEnd) return null;
+    const d = horizonEnd instanceof Date ? horizonEnd : new Date(horizonEnd);
+    return Number.isNaN(d.getTime()) ? null : startOfDay(d);
+  }, [horizonEnd]);
+
   const [open, setOpen] = useState(false);
   const [panelMode, setPanelMode] = useState(() =>
     mode === 'all' || !mode || mode === 'custom' ? 'fy' : mode,
@@ -369,6 +459,12 @@ export default function DashboardPeriodPicker({
         setWeekMonthCursor({ year: anchor.getFullYear(), monthIndex: anchor.getMonth() });
       }
     }
+    if (mode === 'daily' && range?.from) {
+      const anchor = new Date(`${range.from}T12:00:00`);
+      if (!Number.isNaN(anchor.getTime())) {
+        setWeekMonthCursor({ year: anchor.getFullYear(), monthIndex: anchor.getMonth() });
+      }
+    }
     if (Number.isFinite(Number(fyStartYearProp))) setFyYear(Number(fyStartYearProp));
     if (Array.isArray(parts)) setFyParts(parts.filter((p) => p && p !== 'FULL'));
 
@@ -418,11 +514,25 @@ export default function DashboardPeriodPicker({
       buildWeekNavOptions({
         year: weekMonthCursor.year,
         monthIndex: weekMonthCursor.monthIndex,
+        throughDate: horizonCap,
       }),
-    [open, weekMonthCursor.year, weekMonthCursor.monthIndex],
+    [open, weekMonthCursor.year, weekMonthCursor.monthIndex, horizonCap],
   );
-  const monthOptions = useMemo(() => buildMonthOptions(monthYear), [monthYear, open]);
-  const fyOptions = useMemo(() => buildFinancialYearOptions(4), [open]);
+  const dayOptions = useMemo(
+    () =>
+      buildMonthDayOptions(weekMonthCursor.year, weekMonthCursor.monthIndex, {
+        throughDate: horizonCap,
+      }),
+    [open, weekMonthCursor.year, weekMonthCursor.monthIndex, horizonCap],
+  );
+  const monthOptions = useMemo(
+    () => buildMonthOptions(monthYear, { throughDate: horizonCap }),
+    [monthYear, open, horizonCap],
+  );
+  const fyOptions = useMemo(
+    () => buildFinancialYearOptions(4, { throughDate: horizonCap }),
+    [open, horizonCap],
+  );
 
   const triggerLabel = summaryLabel || 'All time';
   const activeRanges =
@@ -468,7 +578,9 @@ export default function DashboardPeriodPicker({
     const cleanParts = (Array.isArray(nextParts) ? nextParts : []).filter(
       (p) => p && p !== 'FULL',
     );
-    const nextRanges = resolveFyPartsToRanges(year, cleanParts);
+    const nextRanges = resolveFyPartsToRanges(year, cleanParts, {
+      capToToday: !horizonCap,
+    });
     emit({
       mode: 'fy',
       ranges: nextRanges,
@@ -493,24 +605,27 @@ export default function DashboardPeriodPicker({
   const shiftWeekMonth = (delta) => {
     setWeekMonthCursor((prev) => {
       const d = new Date(prev.year, prev.monthIndex + delta, 1);
-      const now = new Date();
+      const cap = horizonCap || startOfDay(new Date());
       if (
-        d.getFullYear() > now.getFullYear() ||
-        (d.getFullYear() === now.getFullYear() && d.getMonth() > now.getMonth())
+        d.getFullYear() > cap.getFullYear() ||
+        (d.getFullYear() === cap.getFullYear() && d.getMonth() > cap.getMonth())
       ) {
-        return { year: now.getFullYear(), monthIndex: now.getMonth() };
+        return { year: cap.getFullYear(), monthIndex: cap.getMonth() };
       }
       return { year: d.getFullYear(), monthIndex: d.getMonth() };
     });
   };
 
   const canShiftWeekMonthForward = (() => {
-    const now = new Date();
+    const cap = horizonCap || startOfDay(new Date());
     return (
-      weekMonthCursor.year < now.getFullYear() ||
-      (weekMonthCursor.year === now.getFullYear() && weekMonthCursor.monthIndex < now.getMonth())
+      weekMonthCursor.year < cap.getFullYear() ||
+      (weekMonthCursor.year === cap.getFullYear() && weekMonthCursor.monthIndex < cap.getMonth())
     );
   })();
+
+  const maxMonthYear = (horizonCap || startOfDay(new Date())).getFullYear();
+  const canShiftMonthYearForward = monthYear < maxMonthYear;
 
   return (
     <div ref={rootRef} className={`relative inline-flex min-w-0 ${className}`}>
@@ -588,7 +703,7 @@ export default function DashboardPeriodPicker({
                       type="button"
                       onClick={() => {
                         setPanelMode(opt.key);
-                        if (opt.key === 'weekly') {
+                        if (opt.key === 'weekly' || opt.key === 'daily') {
                           const now = new Date();
                           setWeekMonthCursor({
                             year: now.getFullYear(),
@@ -608,6 +723,57 @@ export default function DashboardPeriodPicker({
               </div>
 
               <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-2.5">
+                {panelMode === 'daily' ? (
+                  <div className="space-y-1.5">
+                    <div className="mb-1 flex items-center justify-between gap-2">
+                      <p className="text-[11px] font-medium text-slate-500">Days</p>
+                      <div className="flex items-center gap-0.5">
+                        <button
+                          type="button"
+                          className="rounded-md px-2 py-1 text-xs font-semibold text-slate-600 hover:bg-slate-50"
+                          onClick={() => shiftWeekMonth(-1)}
+                        >
+                          ←
+                        </button>
+                        <span className="min-w-[6.5rem] text-center text-xs font-bold text-slate-800">
+                          {formatMonthLabel(weekMonthCursor.year, weekMonthCursor.monthIndex)}
+                        </span>
+                        <button
+                          type="button"
+                          className="rounded-md px-2 py-1 text-xs font-semibold text-slate-600 hover:bg-slate-50 disabled:opacity-40"
+                          disabled={!canShiftWeekMonthForward}
+                          onClick={() => shiftWeekMonth(1)}
+                        >
+                          →
+                        </button>
+                      </div>
+                    </div>
+                    {dayOptions.map((opt) => {
+                      const active =
+                        mode === 'daily' &&
+                        range.from === opt.range.from &&
+                        range.to === opt.range.to;
+                      return (
+                        <PeriodOptionRow
+                          key={opt.key}
+                          active={active}
+                          label={opt.label}
+                          sub={opt.sub}
+                          hint={opt.hint}
+                          onClick={() =>
+                            applySelection('daily', opt.range, `${opt.label} · ${opt.sub}`)
+                          }
+                        />
+                      );
+                    })}
+                    {!dayOptions.length ? (
+                      <p className="rounded-xl border border-dashed border-slate-200 px-3 py-4 text-center text-xs text-slate-500">
+                        No days in this month yet.
+                      </p>
+                    ) : null}
+                  </div>
+                ) : null}
+
                 {panelMode === 'weekly' ? (
                   <div className="space-y-1.5">
                     <div className="mb-1 flex items-center justify-between gap-2">
@@ -677,9 +843,9 @@ export default function DashboardPeriodPicker({
                         <button
                           type="button"
                           className="rounded-md px-2 py-1 text-xs font-semibold text-slate-600 hover:bg-slate-50 disabled:opacity-40"
-                          disabled={monthYear >= new Date().getFullYear()}
+                          disabled={!canShiftMonthYearForward}
                           onClick={() =>
-                            setMonthYear((y) => Math.min(new Date().getFullYear(), y + 1))
+                            setMonthYear((y) => Math.min(maxMonthYear, y + 1))
                           }
                         >
                           →
