@@ -38,7 +38,7 @@ import { kfGetJson, resolveKissflowAccountId } from './lib/kfRuntime.js';
 import {
   ensureTaskBusinessIdForCreate,
   fetchTaskTrackerData,
-  enrichTaskTrackerRows,
+  enrichTaskTrackerRowsProgressive,
   resolveTaskBusinessIdFromRow,
   mapProcessSubtaskItem,
 } from './lib/kfTaskTracker.js';
@@ -1427,7 +1427,7 @@ function DashboardDimensionFilters({
   );
 }
 
-/** List first (fast). Revised/history enrich runs after first paint. */
+/** List first (fast). Revised badges fill via progressive admin-only enrich. */
 async function fetchSubtaskTrackerData(kfInstance) {
   return fetchTaskTrackerData(kfInstance, { enrichDetails: false });
 }
@@ -5695,9 +5695,18 @@ function DashboardPagePremium({
     Boolean(embeddedInHub) && contentView === 'projects';
 
   const hubWorkItemsLoadedRef = useRef(false);
+  const taskRevisedEnrichAbortRef = useRef(null);
 
   const reloadDashboardData = useCallback(async () => {
     if (!kfInstance?.api) return;
+
+    // Cancel any in-flight Revised enrich from a prior reload.
+    try {
+      taskRevisedEnrichAbortRef.current?.abort?.();
+    } catch {
+      /* ignore */
+    }
+    taskRevisedEnrichAbortRef.current = null;
 
     // mis-table-style hub: only load process subtasks for nested accordion (no project/task reports).
     if (lightHubTasksMode) {
@@ -5748,16 +5757,21 @@ function DashboardPagePremium({
     setApiSubtaskData(subtasks);
     setApiProcessSubtaskData(processSubtasks);
 
-    // Revised badges need per-task history; fill in after the portfolio is on screen.
-    // Skip on projects hub (handled above) — detail enrich floods the ~400/min Kissflow limit.
+    // Revised badges: staggered admin-only detail (not the old ≤80×retries burst).
+    // Progress/KPIs already work from the list; badges fill in chunk-by-chunk.
     if (subtasks.length > 0) {
-      void enrichTaskTrackerRows(kfInstance, subtasks)
-        .then((enriched) => {
-          if (Array.isArray(enriched) && enriched.length > 0) setApiSubtaskData(enriched);
-        })
-        .catch((error) => {
-          console.warn('Task revision enrich failed:', error?.message || error);
-        });
+      const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      taskRevisedEnrichAbortRef.current = ac;
+      void enrichTaskTrackerRowsProgressive(kfInstance, subtasks, {
+        signal: ac?.signal,
+        onChunk: (partial) => {
+          if (ac?.signal?.aborted) return;
+          if (Array.isArray(partial) && partial.length > 0) setApiSubtaskData(partial);
+        },
+      }).catch((error) => {
+        if (ac?.signal?.aborted) return;
+        console.warn('Task revision enrich (progressive) failed:', error?.message || error);
+      });
     }
   }, [kfInstance, lightHubTasksMode, lightHubProjectsMode]);
 
@@ -5771,8 +5785,9 @@ function DashboardPagePremium({
         fetchSubtaskTrackerData(kfInstance),
         fetchAllSubtasks(kfInstance, { enrichDetails: false }),
       ]);
+      const tasks = tasksRes.status === 'fulfilled' ? (tasksRes.value ?? []) : [];
       if (tasksRes.status === 'fulfilled') {
-        setApiSubtaskData(tasksRes.value ?? []);
+        setApiSubtaskData(tasks);
       } else {
         console.warn('Hub projects lazy tasks failed:', tasksRes.reason?.message || tasksRes.reason);
         hubWorkItemsLoadedRef.current = false;
@@ -5781,6 +5796,25 @@ function DashboardPagePremium({
         setApiProcessSubtaskData(
           (processSubtasksRes.value?.items ?? []).map(mapProcessSubtaskItem),
         );
+      }
+      if (tasks.length > 0) {
+        try {
+          taskRevisedEnrichAbortRef.current?.abort?.();
+        } catch {
+          /* ignore */
+        }
+        const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        taskRevisedEnrichAbortRef.current = ac;
+        void enrichTaskTrackerRowsProgressive(kfInstance, tasks, {
+          signal: ac?.signal,
+          onChunk: (partial) => {
+            if (ac?.signal?.aborted) return;
+            if (Array.isArray(partial) && partial.length > 0) setApiSubtaskData(partial);
+          },
+        }).catch((error) => {
+          if (ac?.signal?.aborted) return;
+          console.warn('Hub task revision enrich (progressive) failed:', error?.message || error);
+        });
       }
     } catch (error) {
       hubWorkItemsLoadedRef.current = false;
@@ -5988,6 +6022,11 @@ function DashboardPagePremium({
 
   useEffect(() => () => {
     if (insightPulseTimerRef.current) clearTimeout(insightPulseTimerRef.current);
+    try {
+      taskRevisedEnrichAbortRef.current?.abort?.();
+    } catch {
+      /* ignore */
+    }
   }, []);
 
   useEffect(() => {
@@ -6004,8 +6043,7 @@ function DashboardPagePremium({
     async function run() {
       try {
         await reloadDashboardData();
-        // Projects hub: after case list paints, load tasks/subtasks in background (no detail enrich).
-        // Keeps progress % / task counts accurate without the ≤80 N+1 surge.
+        // Projects hub: after case list paints, load tasks/subtasks then progressive Revised enrich.
         if (!cancelled && lightHubProjectsMode) {
           void ensureHubProjectWorkItems();
         }

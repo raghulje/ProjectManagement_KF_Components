@@ -9,6 +9,10 @@ const TASK_PROCESS_ID = 'Project_Sub_Task_A01';
 const TASK_REPORT_PATH = `/process-report/2/{acc}/${TASK_PROCESS_ID}/Live_Sub_Task_Task_Wise_A00`;
 const INDIVIDUAL_TASK_REPORT_PATH = `/process-report/2/{acc}/${TASK_PROCESS_ID}/My_Individual_Tasks_A00`;
 const TASK_DETAIL_CONCURRENCY = 8;
+/** Rate-limit-friendly bulk enrich: few parallel admin GETs, no fallback waterfall. */
+const TASK_REVISED_ENRICH_CONCURRENCY = 3;
+const TASK_REVISED_ENRICH_CHUNK = 12;
+const TASK_REVISED_ENRICH_DELAY_MS = 1500;
 const TASK_LIST_MAX_PAGES = 200;
 
 function extractApiRows(payload) {
@@ -312,6 +316,11 @@ export async function enrichRawTaskRowsWithInstanceDetail(kfInstance, rows, opti
   if (!paths) return list;
 
   const maxRows = Math.max(0, Number(options.maxRows) || 80);
+  const adminOnly = options.adminOnly === true;
+  const concurrency = Math.max(
+    1,
+    Number(options.concurrency) || (adminOnly ? TASK_REVISED_ENRICH_CONCURRENCY : TASK_DETAIL_CONCURRENCY),
+  );
   const needIdx = [];
   list.forEach((row, idx) => {
     if (maxRows && needIdx.length >= maxRows) return;
@@ -320,7 +329,7 @@ export async function enrichRawTaskRowsWithInstanceDetail(kfInstance, rows, opti
   });
   if (!needIdx.length) return list;
 
-  const details = await runWithConcurrency(needIdx, TASK_DETAIL_CONCURRENCY, async (idx) => {
+  const details = await runWithConcurrency(needIdx, concurrency, async (idx) => {
     const row = list[idx];
     const id = String(row?._id || row?._item_id || row?.InstanceID || '').trim();
     const act = activityInstanceIdOf(row);
@@ -332,23 +341,21 @@ export async function enrichRawTaskRowsWithInstanceDetail(kfInstance, rows, opti
     /** @type {{ path: string, useAccessKeys?: boolean }[]} */
     const tryCalls = [];
 
-    // 1) Admin item detail — reliable for Withdrawn / completed (no activity id) + form fields.
+    // Admin item detail — enough for Table::Task_History / Revised badges.
     tryCalls.push({ path: adminDetailPath, useAccessKeys: true });
-    tryCalls.push({ path: adminDetailPath, useAccessKeys: false });
-
-    // 2) Instance + activity (Postman open-step shape) when activity is present.
-    if (act) {
-      tryCalls.push({
-        path: `/process/2/${paths.accountId}/${paths.processId}/${encodeURIComponent(id)}/${encodeURIComponent(act)}`,
-        useAccessKeys: true,
-      });
-      tryCalls.push({ path: paths.getInstancePath(id, act), useAccessKeys: true });
-      tryCalls.push({ path: paths.getInstancePath(id, act), useAccessKeys: false });
+    if (!adminOnly) {
+      tryCalls.push({ path: adminDetailPath, useAccessKeys: false });
+      if (act) {
+        tryCalls.push({
+          path: `/process/2/${paths.accountId}/${paths.processId}/${encodeURIComponent(id)}/${encodeURIComponent(act)}`,
+          useAccessKeys: true,
+        });
+        tryCalls.push({ path: paths.getInstancePath(id, act), useAccessKeys: true });
+        tryCalls.push({ path: paths.getInstancePath(id, act), useAccessKeys: false });
+      }
+      tryCalls.push({ path: paths.getInstancePath(id), useAccessKeys: true });
+      tryCalls.push({ path: paths.getInstancePath(id), useAccessKeys: false });
     }
-
-    // 3) Instance without activity.
-    tryCalls.push({ path: paths.getInstancePath(id), useAccessKeys: true });
-    tryCalls.push({ path: paths.getInstancePath(id), useAccessKeys: false });
 
     for (const call of tryCalls) {
       try {
@@ -1041,6 +1048,66 @@ export async function enrichTaskTrackerRows(kfInstance, mappedRows, options = {}
   const raws = list.map((row) => (row?.raw && typeof row.raw === 'object' ? row.raw : row));
   const enriched = await enrichRawTaskRowsWithInstanceDetail(kfInstance, raws, options);
   return dedupeTaskRows(enriched.map((r, idx) => mapAdminTaskRow(r, idx)));
+}
+
+/**
+ * Fill Revised badges without a rate-limit surge:
+ * admin-only detail (1 GET/row), small chunks, short pause between chunks.
+ * Calls `onChunk(mappedRowsSoFar)` after each chunk so the UI can update progressively.
+ */
+export async function enrichTaskTrackerRowsProgressive(kfInstance, mappedRows, options = {}) {
+  const list = Array.isArray(mappedRows) ? mappedRows.slice() : [];
+  if (!list.length || !kfInstance) return list;
+
+  const chunkSize = Math.max(1, Number(options.chunkSize) || TASK_REVISED_ENRICH_CHUNK);
+  const delayMs = Math.max(0, Number(options.delayMs) || TASK_REVISED_ENRICH_DELAY_MS);
+  const concurrency = Math.max(1, Number(options.concurrency) || TASK_REVISED_ENRICH_CONCURRENCY);
+  const onChunk = typeof options.onChunk === 'function' ? options.onChunk : null;
+  const signal = options.signal;
+
+  const needIdx = [];
+  list.forEach((row, idx) => {
+    const raw = row?.raw && typeof row.raw === 'object' ? row.raw : row;
+    if (rawRowNeedsInstanceEnrichment(raw)) needIdx.push(idx);
+  });
+  if (!needIdx.length) return list;
+
+  let working = list;
+  for (let i = 0; i < needIdx.length; i += chunkSize) {
+    if (signal?.aborted) break;
+    const sliceIdx = needIdx.slice(i, i + chunkSize);
+    const sliceRows = sliceIdx.map((idx) => {
+      const row = working[idx];
+      return row?.raw && typeof row.raw === 'object' ? row.raw : row;
+    });
+    const enrichedRaws = await enrichRawTaskRowsWithInstanceDetail(kfInstance, sliceRows, {
+      maxRows: sliceRows.length,
+      adminOnly: true,
+      concurrency,
+    });
+    working = working.slice();
+    sliceIdx.forEach((rowIdx, j) => {
+      const prev = working[rowIdx];
+      const enrichedRaw = enrichedRaws[j];
+      if (!enrichedRaw) return;
+      working[rowIdx] = mapAdminTaskRow(
+        {
+          ...enrichedRaw,
+          _id: enrichedRaw._id || prev?._id || prev?.InstanceID,
+          _item_id: enrichedRaw._item_id || prev?._item_id,
+          _activity_instance_id:
+            enrichedRaw._activity_instance_id || prev?._activity_instance_id || prev?.ActivityID,
+        },
+        rowIdx,
+      );
+    });
+    working = dedupeTaskRows(working);
+    onChunk?.(working);
+    if (i + chunkSize < needIdx.length && delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  return working;
 }
 
 /**
